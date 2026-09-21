@@ -238,19 +238,20 @@ python3 Source/ct_preupgrade_precheck.py --region us-east-1 --profile my-mgmt-ad
 # Emit a JSON report and also fail on WARNING (UNKNOWN already fails by default):
 python3 Source/ct_preupgrade_precheck.py --json report.json --strict
 
-# Override shared account discovery if the manifest lookup is unavailable:
+# Fallback only: force the shared account ids when the manifest lookup is unavailable
 python3 Source/ct_preupgrade_precheck.py \
     --audit-account 111111111111 --log-archive-account 222222222222
 
-# Opt-in deeper checks (slower / heuristic; off by default):
-python3 Source/ct_preupgrade_precheck.py --detect-drift            # active StackSet drift detection
-python3 Source/ct_preupgrade_precheck.py --check-member-roles      # assume into every enrolled account
-python3 Source/ct_preupgrade_precheck.py --check-kms-policy        # verify CMK key policy grants CT services
-python3 Source/ct_preupgrade_precheck.py --check-orphaned-resources # (broken LZ) find leftover resources that collide on Repair/Reset
+# Deeper scan — the opt-in checks compose, and are slower. Each one is described in
+# "What it checks" above, with the APIs it calls and the severity it reports.
+python3 Source/ct_preupgrade_precheck.py \
+    --detect-drift --check-member-roles --check-kms-policy
 
-# Output formatting:
-python3 Source/ct_preupgrade_precheck.py --color always            # force color (e.g. when piping to a pager)
-python3 Source/ct_preupgrade_precheck.py --color never             # disable color
+# On a landing zone that looks broken: find leftovers that collide on Repair/Reset
+python3 Source/ct_preupgrade_precheck.py --check-orphaned-resources
+
+# Full flag reference, including the --color modes described below
+python3 Source/ct_preupgrade_precheck.py --help
 ```
 
 The text report is color-coded by severity (BLOCKER red, WARNING yellow, UNVERIFIED magenta,

@@ -169,6 +169,7 @@ _CHECK_DOCS = {
     "baselines_drift": f"{DOC}/resolve-drift.html",
     "stacksets": f"{DOC}/drift.html",
     "stacksets_member": f"{DOC}/drift.html",
+    "stacksets_expected": f"{DOC}/drift.html",
     "stacksets_orphaned": f"{DOC}/shared-account-resources.html",
     "stackset_drift": f"{DOC}/drift.html",
     "stackset_drift_member": f"{DOC}/drift.html",
@@ -830,6 +831,34 @@ def check_enabled_baselines(ctx: Context, report: Report) -> None:
                            f"{_scope_suffix(no_status)}"))
 
 
+# StackSets whose stack instances are EXPECTED to fail with an "already exists" collision.
+#
+# AWSControlTowerExecutionRole deploys the AWSControlTowerExecution role into member
+# accounts when an OU is registered or re-registered. That role is very often already
+# present — created by hand, or created automatically by AWS Organizations when the
+# account was created — so the instance fails while the end state (the role exists) is
+# exactly what Control Tower wanted. The Control Tower service team confirms these
+# failed instances are expected and do not cause a landing-zone update or an OU
+# registration failure; environments with hundreds of them upgrade normally.
+#
+# Deliberately narrow. An "already exists" collision on a *baseline* StackSet is NOT
+# benign: it usually means a previously deleted StackSet left resources behind, which
+# is a common cause of repair failures on a broken landing zone.
+_EXPECTED_FAILURE_STACKSETS = ("AWSControlTowerExecutionRole",)
+
+
+def _is_expected_instance_failure(stackset: str, reason: str) -> bool:
+    """True when a FAILED stack instance is a known-harmless collision, not a problem."""
+    return (stackset in _EXPECTED_FAILURE_STACKSETS
+            and "already exists" in (reason or "").lower())
+
+
+def _short_reason(text: str, limit: int = 100) -> str:
+    """Collapse a CloudFormation StatusReason to one readable line for a report row."""
+    text = " ".join((text or "").split())
+    return text if len(text) <= limit else text[:limit - 3] + "..."
+
+
 def check_stacksets(ctx: Context, report: Report) -> None:
     try:
         cfn = ctx.session.client("cloudformation", region_name=ctx.region)
@@ -852,7 +881,7 @@ def check_stacksets(ctx: Context, report: Report) -> None:
     # afterward (Re-register OU). So only shared-account instances are hard blockers.
     shared = ctx.shared_accounts
 
-    shared_bad, member_bad, outdated, orphaned = [], [], [], []
+    shared_bad, member_bad, outdated, orphaned, expected = [], [], [], [], []
     skipped: List[List[str]] = []
     for name in names:
         try:
@@ -867,6 +896,9 @@ def check_stacksets(ctx: Context, report: Report) -> None:
             detailed = (i.get("StackInstanceStatus") or {}).get("DetailedStatus")
             drift = i.get("DriftStatus")
             acct = i.get("Account", "")
+            # Why the instance is in this state. Grading a failure without reading this
+            # cannot tell an expected collision apart from a real problem.
+            reason = i.get("StatusReason") or ""
             # Show summary + detailed when they differ (e.g. OUTDATED/FAILED) so the
             # real signal isn't hidden behind the summary status.
             status_disp = str(status or detailed)
@@ -877,11 +909,19 @@ def check_stacksets(ctx: Context, report: Report) -> None:
             if org_ids is not None and acct and acct not in org_ids:
                 orphaned.append(row)
                 continue
+            drift_bad = (drift == "DRIFTED" and not getattr(ctx, "detect_drift", False))
             is_bad = (status == "INOPERABLE"
                       or detailed in ("FAILED", "INOPERABLE", "CANCELLED")
-                      or (drift == "DRIFTED" and not getattr(ctx, "detect_drift", False)))
+                      or drift_bad)
             if is_bad:
-                (shared_bad if acct in shared else member_bad).append(row)
+                # Severity follows the failure REASON, not the account tier. An expected
+                # "already exists" collision is not a finding in any account. Drift is
+                # never excused this way — a drifted instance is a real difference.
+                if not drift_bad and _is_expected_instance_failure(name, reason):
+                    expected.append(row + [_short_reason(reason)])
+                else:
+                    (shared_bad if acct in shared else member_bad).append(
+                        row + [_short_reason(reason)])
             elif status == "OUTDATED":
                 # Behind the current template. NOT refreshed by the landing-zone update itself —
                 # enrolled accounts are updated separately, by re-registering/resetting the OU.
@@ -896,7 +936,8 @@ def check_stacksets(ctx: Context, report: Report) -> None:
                            "the landing-zone update — Control Tower manages those accounts through "
                            "the landing zone, so they are exactly what the update/repair/reset "
                            "acts on.",
-                           cols=["StackSet", "Account", "Region", "Status", "Drift"], rows=shared_bad,
+                           cols=["StackSet", "Account", "Region", "Status", "Drift", "Reason"],
+                           rows=shared_bad,
                            remediation="Repair or remove (Retain Stacks) the affected shared-account "
                                        "instances before upgrading."))
     if member_bad:
@@ -907,9 +948,26 @@ def check_stacksets(ctx: Context, report: Report) -> None:
                            "acts on the shared accounts first and does not touch member accounts, so this "
                            "does NOT block the landing-zone update. It can, however, affect that account "
                            "when you later update/re-register its OU — worth reconciling.",
-                           cols=["StackSet", "Account", "Region", "Status", "Drift"], rows=member_bad,
+                           cols=["StackSet", "Account", "Region", "Status", "Drift", "Reason"],
+                           rows=member_bad,
                            remediation="Reconcile (repair/revert) before you update or re-register that "
                                        "account's OU."))
+    if expected:
+        report.add(Finding("stacksets_expected", INFO,
+                           f"{len(expected)} StackSet instance(s) failed with an expected "
+                           "\"already exists\" collision",
+                           "These are instances of the AWSControlTowerExecutionRole StackSet, which "
+                           "deploys the AWSControlTowerExecution role when an OU is registered. The "
+                           "role was already present in these accounts — commonly because AWS "
+                           "Organizations created it with the account, or someone created it by hand "
+                           "— so the instance failed while the end state Control Tower wanted (the "
+                           "role exists) is already true. Expected, and does NOT block a "
+                           "landing-zone update or OU registration. Environments with hundreds of "
+                           "these upgrade normally.",
+                           cols=["StackSet", "Account", "Region", "Status", "Drift", "Reason"],
+                           rows=expected,
+                           remediation="No action needed. Deleting the role to \"fix\" this would "
+                                       "break Control Tower's access to the account."))
     if orphaned:
         report.add(Finding("stacksets_orphaned", INFO,
                            f"{len(orphaned)} stale StackSet instance(s) target accounts no longer in the org",
@@ -931,7 +989,7 @@ def check_stacksets(ctx: Context, report: Report) -> None:
                                "template. No inoperable/failed/drifted instances were found.",
                                cols=["StackSet", "Account", "Region", "Status", "Drift"],
                                rows=outdated))
-        elif not orphaned:
+        elif not orphaned and not expected:
             report.add(Finding("stacksets", PASS,
                                f"All instances CURRENT across {len(names)} AWSControlTower "
                                f"StackSet(s){_scope_suffix(skipped)}"))

@@ -261,6 +261,87 @@ class TestBlockerPaths(unittest.TestCase):
         self.assertIn(ct.INFO, lv)
         self.assertNotIn(ct.BLOCKER, lv)
 
+    # 8a-ii. Failure REASON decides severity, not the account tier -----------------
+    # Verbatim reason text from a real landing zone. The AWSControlTowerExecution role
+    # already existed (AWS Organizations creates it with the account), so the instance
+    # failed while the end state Control Tower wanted was already true. The Control
+    # Tower service team confirms these are expected and do not block an update.
+    ALREADY_EXISTS = ("ResourceLogicalId:AWSControlTowerExecutionRole, "
+                      "ResourceType:AWS::IAM::Role, "
+                      "ResourceStatusReason:AWSControlTowerExecution already exists.")
+
+    def _exec_role_instance(self, account, reason, drift="NOT_CHECKED"):
+        return FakeClient({
+            "list_stack_sets": {"Summaries": [{"StackSetName": "AWSControlTowerExecutionRole"}]},
+            "list_stack_instances": {"Summaries": [
+                {"Account": account, "Region": "us-east-1", "Status": "OUTDATED",
+                 "StackInstanceStatus": {"DetailedStatus": "FAILED"},
+                 "StatusReason": reason, "DriftStatus": drift}]},
+        })
+
+    def test_execution_role_already_exists_in_shared_is_not_a_blocker(self):
+        # 111111111111 is the management account, i.e. a shared account. Before the
+        # reason was read, this produced "NOT SAFE TO UPGRADE" on a healthy landing zone.
+        orgs = FakeClient({"list_accounts": {"Accounts": [{"Id": "111111111111", "Status": "ACTIVE"}]}})
+        ctx = make_ctx({"cloudformation": self._exec_role_instance("111111111111", self.ALREADY_EXISTS),
+                        "organizations": orgs})
+        lv = levels(_run(ct.check_stacksets, ctx))
+        self.assertIn(ct.INFO, lv)
+        self.assertNotIn(ct.BLOCKER, lv)
+        self.assertNotIn(ct.WARNING, lv)
+
+    def test_execution_role_already_exists_in_member_is_not_a_warning(self):
+        orgs = FakeClient({"list_accounts": {"Accounts": [
+            {"Id": "111111111111", "Status": "ACTIVE"},
+            {"Id": "222222222222", "Status": "ACTIVE"}]}})
+        ctx = make_ctx({"cloudformation": self._exec_role_instance("222222222222", self.ALREADY_EXISTS),
+                        "organizations": orgs})
+        lv = levels(_run(ct.check_stacksets, ctx))
+        self.assertIn(ct.INFO, lv)
+        self.assertNotIn(ct.WARNING, lv)
+        self.assertNotIn(ct.BLOCKER, lv)
+
+    def test_execution_role_failure_for_another_reason_still_blocks(self):
+        # Only the "already exists" collision is expected. Any other failure on the same
+        # StackSet is a real problem and must keep its severity.
+        orgs = FakeClient({"list_accounts": {"Accounts": [{"Id": "111111111111", "Status": "ACTIVE"}]}})
+        ctx = make_ctx({"cloudformation": self._exec_role_instance(
+            "111111111111", "AccessDenied: not authorized to perform iam:CreateRole"),
+            "organizations": orgs})
+        self.assertIn(ct.BLOCKER, levels(_run(ct.check_stacksets, ctx)))
+
+    def test_baseline_stackset_already_exists_still_blocks(self):
+        # The exemption is deliberately narrow. An "already exists" collision on a
+        # BASELINE StackSet means a deleted StackSet left resources behind, which is a
+        # common cause of repair failures — it must stay a blocker.
+        cfn = FakeClient({
+            "list_stack_sets": {"Summaries": [{"StackSetName": "AWSControlTowerBP-BASELINE-CONFIG"}]},
+            "list_stack_instances": {"Summaries": [
+                {"Account": "111111111111", "Region": "us-east-1", "Status": "OUTDATED",
+                 "StackInstanceStatus": {"DetailedStatus": "FAILED"},
+                 "StatusReason": "AWSControlTowerBP-BASELINE-CONFIG already exists.",
+                 "DriftStatus": "NOT_CHECKED"}]},
+        })
+        orgs = FakeClient({"list_accounts": {"Accounts": [{"Id": "111111111111", "Status": "ACTIVE"}]}})
+        ctx = make_ctx({"cloudformation": cfn, "organizations": orgs})
+        self.assertIn(ct.BLOCKER, levels(_run(ct.check_stacksets, ctx)))
+
+    def test_execution_role_already_exists_but_drifted_still_blocks(self):
+        # Drift is never excused by the reason: a drifted instance is a real difference
+        # between the deployed stack and its template.
+        orgs = FakeClient({"list_accounts": {"Accounts": [{"Id": "111111111111", "Status": "ACTIVE"}]}})
+        ctx = make_ctx({"cloudformation": self._exec_role_instance(
+            "111111111111", self.ALREADY_EXISTS, drift="DRIFTED"), "organizations": orgs})
+        self.assertIn(ct.BLOCKER, levels(_run(ct.check_stacksets, ctx)))
+
+    def test_expected_collision_does_not_claim_all_instances_current(self):
+        # The PASS line says every instance is CURRENT. An expected collision is not a
+        # problem, but it is also not CURRENT, so PASS must not be emitted.
+        orgs = FakeClient({"list_accounts": {"Accounts": [{"Id": "111111111111", "Status": "ACTIVE"}]}})
+        ctx = make_ctx({"cloudformation": self._exec_role_instance("111111111111", self.ALREADY_EXISTS),
+                        "organizations": orgs})
+        self.assertNotIn(ct.PASS, levels(_run(ct.check_stacksets, ctx)))
+
     # 8b. Active StackSet drift detection (opt-in --detect-drift) ------------------
     def test_active_drift_skipped_when_disabled(self):
         ctx = make_ctx()  # detect_drift defaults False

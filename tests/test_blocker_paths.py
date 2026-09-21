@@ -191,6 +191,69 @@ class TestBlockerPaths(unittest.TestCase):
         ctx = make_ctx({"controltower": ctl})
         self.assertIn(ct.BLOCKER, levels(_run(ct.check_enabled_baselines, ctx)))
 
+    # 7b. Baselines targeting an OU that no longer exists --------------------------
+    # A customer deleting an OU in Organizations without deregistering it from Control
+    # Tower leaves Control Tower referencing a missing OU; the next landing-zone update
+    # fails with TargetNotFoundException and the landing zone is left FAILED.
+    @staticmethod
+    def _ou_arn(ou_id, account="111111111111", org="o-example"):
+        return ":".join(["arn", "aws", "organizations", "", account, "ou/%s/%s" % (org, ou_id)])
+
+    @staticmethod
+    def _acct_target(acct, account="111111111111", org="o-example"):
+        return ":".join(["arn", "aws", "organizations", "", account,
+                         "account/%s/%s" % (org, acct)])
+
+    def _baselines_ctx(self, targets, existing_ou_ids):
+        ctl = FakeClient({"list_enabled_baselines": {"enabledBaselines": [
+            {"targetIdentifier": t, "baselineVersion": "4.0",
+             "statusSummary": {"status": "SUCCEEDED"}} for t in targets]}})
+        ctx = make_ctx({"controltower": ctl})
+        ctx.all_ou_arns = lambda: [{"Id": i, "Arn": self._ou_arn(i), "Name": i}
+                                   for i in existing_ou_ids]
+        return ctx
+
+    def test_stale_baseline_target_warns(self):
+        ctx = self._baselines_ctx([self._ou_arn("ou-gone")], ["ou-live"])
+        lv = levels(_run(ct.check_stale_baseline_targets, ctx))
+        self.assertIn(ct.WARNING, lv)
+        self.assertNotIn(ct.PASS, lv)
+
+    def test_baseline_targets_all_resolve_passes(self):
+        ctx = self._baselines_ctx([self._ou_arn("ou-live")], ["ou-live", "ou-other"])
+        lv = levels(_run(ct.check_stale_baseline_targets, ctx))
+        self.assertIn(ct.PASS, lv)
+        self.assertNotIn(ct.WARNING, lv)
+
+    def test_account_targeted_baselines_are_not_flagged_stale(self):
+        # Account targets are never in the OU set. Treating them as stale would make this
+        # check fire on every healthy landing zone.
+        ctx = self._baselines_ctx([self._acct_target("333333333333")], ["ou-live"])
+        lv = levels(_run(ct.check_stale_baseline_targets, ctx))
+        self.assertIn(ct.PASS, lv)
+        self.assertNotIn(ct.WARNING, lv)
+
+    def test_stale_baseline_targets_ou_read_failure_is_unknown(self):
+        # Failing to read the OU tree must not read as "nothing stale".
+        ctx = self._baselines_ctx([self._ou_arn("ou-gone")], [])
+
+        def boom():
+            raise client_error("AccessDeniedException", "ListOrganizationalUnitsForParent")
+        ctx.all_ou_arns = boom
+        lv = levels(_run(ct.check_stale_baseline_targets, ctx))
+        self.assertIn(ct.UNKNOWN, lv)
+        self.assertNotIn(ct.PASS, lv)
+
+    def test_stale_baseline_targets_baseline_read_failure_is_unknown(self):
+        ctl = FakeClient(errors={"list_enabled_baselines":
+                                 client_error("ThrottlingException", "ListEnabledBaselines")})
+        ctx = make_ctx({"controltower": ctl})
+        ctx.all_ou_arns = lambda: [{"Id": "ou-live", "Arn": self._ou_arn("ou-live"),
+                                    "Name": "ou-live"}]
+        lv = levels(_run(ct.check_stale_baseline_targets, ctx))
+        self.assertIn(ct.UNKNOWN, lv)
+        self.assertNotIn(ct.PASS, lv)
+
     # 8. StackSets: INOPERABLE blocks; OUTDATED is INFO ----------------------------
     def test_stacksets_inoperable_in_shared_blocks(self):
         cfn = FakeClient({

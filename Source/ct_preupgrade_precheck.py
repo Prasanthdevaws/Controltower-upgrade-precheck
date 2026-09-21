@@ -167,6 +167,7 @@ _CHECK_DOCS = {
     "closed_with_pp": f"{DOC}/troubleshooting.html",
     "controls_drift": f"{DOC}/resolving-drift.html",
     "baselines_drift": f"{DOC}/resolve-drift.html",
+    "stale_baseline_targets": f"{DOC}/troubleshooting.html",
     "stacksets": f"{DOC}/drift.html",
     "stacksets_member": f"{DOC}/drift.html",
     "stacksets_expected": f"{DOC}/drift.html",
@@ -829,6 +830,64 @@ def check_enabled_baselines(ctx: Context, report: Report) -> None:
         report.add(Finding("baselines_drift", PASS,
                            f"All {len(baselines)} enabled baselines SUCCEEDED / IN_SYNC"
                            f"{_scope_suffix(no_status)}"))
+
+
+def check_stale_baseline_targets(ctx: Context, report: Report) -> None:
+    """Enabled baselines whose target OU no longer exists in AWS Organizations.
+
+    Deleting an OU in Organizations without first deregistering it from Control Tower
+    leaves Control Tower holding a reference to an OU that is gone. A later
+    landing-zone update calls ListPoliciesForTarget against the missing OU, fails with
+    TargetNotFoundException, and leaves the landing zone FAILED — which also blocks
+    registering OUs and enabling controls. Clearing the stale reference is done on the
+    Control Tower side, so the customer cannot simply retry. Worth knowing before
+    starting an update that does not roll back.
+    """
+    try:
+        existing = {ou["Arn"] for ou in ctx.all_ou_arns()}
+    except (ClientError, BotoCoreError) as e:
+        report.add(Finding("stale_baseline_targets", UNKNOWN,
+                           "Could not enumerate OUs to validate baseline targets", str(e)))
+        return
+    try:
+        baselines = _collect(ctx.ct, "list_enabled_baselines", "enabledBaselines",
+                             includeChildren=True)
+    except (ClientError, BotoCoreError) as e:
+        report.add(Finding("stale_baseline_targets", UNKNOWN,
+                           "Could not list enabled baselines", str(e)))
+        return
+    # A baseline target is either an OU ARN or an account ARN. Only OU targets can be
+    # validated against the OU tree; account targets are covered by other checks.
+    ou_targets = [b for b in baselines if ":ou/" in str(b.get("targetIdentifier") or "")]
+    stale = [[str(b.get("targetIdentifier") or ""),
+              str(b.get("baselineVersion") or ""),
+              str((b.get("statusSummary") or {}).get("status") or "")]
+             for b in ou_targets
+             if str(b.get("targetIdentifier") or "") not in existing]
+    if stale:
+        report.add(Finding("stale_baseline_targets", WARNING,
+                           f"{len(stale)} enabled baseline(s) target an OU that no longer exists",
+                           "Control Tower still has a baseline enabled on an organizational unit "
+                           "that is not present in AWS Organizations, which happens when an OU is "
+                           "deleted directly in Organizations without being deregistered from "
+                           "Control Tower first. A landing-zone update reads the policies attached "
+                           "to each OU it knows about; when one is missing the update fails with "
+                           "TargetNotFoundException and the landing zone is left in FAILED state, "
+                           "which then also blocks registering OUs and enabling controls. Resolve "
+                           "this before starting an update, because the update does not roll back.",
+                           cols=["Baseline target (missing OU)", "Baseline version", "Status"],
+                           rows=stale,
+                           remediation="Confirm the OU is genuinely gone, then raise an AWS Support "
+                                       "case to clear the stale reference from Control Tower's "
+                                       "configuration. Deregister an OU in Control Tower BEFORE "
+                                       "deleting it in Organizations to avoid this."))
+    elif ou_targets:
+        report.add(Finding("stale_baseline_targets", PASS,
+                           f"All {len(ou_targets)} OU-targeted baseline(s) reference an OU that "
+                           f"still exists"))
+    else:
+        report.add(Finding("stale_baseline_targets", PASS,
+                           "No OU-targeted baselines to validate"))
 
 
 # StackSets whose stack instances are EXPECTED to fail with an "already exists" collision.
@@ -2583,6 +2642,7 @@ CHECKS = [
     check_provisioned_product_health,
     check_enabled_controls,
     check_enabled_baselines,
+    check_stale_baseline_targets,
     check_stacksets,
     check_expected_stacksets,
     check_stackset_active_drift,

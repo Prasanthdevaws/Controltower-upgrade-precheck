@@ -642,6 +642,19 @@ def check_managed_accounts(ctx: Context, report: Report) -> None:
                            "No SUSPENDED accounts in the organization"))
 
 
+# Account Factory products are the only Service Catalog provisioned products Control Tower
+# owns. The management account's Service Catalog commonly also holds unrelated products —
+# CFN_STACK, CFN_STACKSET, TERRAFORM_OPEN_SOURCE — whose health has nothing to do with a
+# landing-zone update. On one test organization 31 of 32 unhealthy products were CFN_STACK,
+# so every provisioned-product check filters on this type before judging anything.
+_ACCOUNT_FACTORY_PP_TYPE = "CONTROL_TOWER_ACCOUNT"
+
+
+def _account_factory_products(pps: List[dict]) -> List[dict]:
+    """Only the provisioned products Account Factory created."""
+    return [p for p in pps if p.get("Type") == _ACCOUNT_FACTORY_PP_TYPE]
+
+
 def check_suspended_with_provisioned_product(ctx: Context, report: Report) -> None:
     """The classic upgrade blocker: a closed/suspended account whose Account Factory
     Service Catalog provisioned product was never terminated -> AWSControlTowerExecution
@@ -665,6 +678,10 @@ def check_suspended_with_provisioned_product(ctx: Context, report: Report) -> No
         report.add(Finding("closed_with_pp", UNKNOWN,
                            "Could not search Service Catalog provisioned products", str(e)))
         return
+    # Only Account Factory products matter here. An unrelated product (a CFN_STACK, say)
+    # that merely happens to mention a suspended account id would otherwise raise a
+    # BLOCKER that has nothing to do with Control Tower.
+    pps = _account_factory_products(pps)
     # Account Factory products carry the vended account id in PhysicalId / Name; match loosely.
     hits = []
     for pp in pps:
@@ -896,26 +913,34 @@ def check_stale_baseline_targets(ctx: Context, report: Report) -> None:
                            "No OU-targeted baselines to validate"))
 
 
-# StackSets whose stack instances are EXPECTED to fail with an "already exists" collision.
+# StackSets whose failed stack instances are NOT a reliable signal of a real problem.
 #
-# AWSControlTowerExecutionRole deploys the AWSControlTowerExecution role into member
-# accounts when an OU is registered or re-registered. That role is very often already
-# present — created by hand, or created automatically by AWS Organizations when the
-# account was created — so the instance fails while the end state (the role exists) is
-# exactly what Control Tower wanted. The Control Tower service team confirms these
-# failed instances are expected and do not cause a landing-zone update or an OU
-# registration failure; environments with hundreds of them upgrade normally.
+# AWSControlTowerExecutionRole deploys the AWSControlTowerExecution role into accounts when
+# an OU is registered or re-registered. That role is very often already present — AWS
+# Organizations creates it with the account, or someone created it by hand — so the instance
+# fails while the end state Control Tower wanted is already true. Both the Control Tower
+# service team and an independent Control Tower SME state that failed instances on this
+# StackSet are expected, do not block a landing-zone update or OU registration, and do not
+# indicate that the role is missing; organizations with hundreds of them upgrade normally.
 #
-# Deliberately narrow. An "already exists" collision on a *baseline* StackSet is NOT
-# benign: it usually means a previously deleted StackSet left resources behind, which
-# is a common cause of repair failures on a broken landing zone.
-_EXPECTED_FAILURE_STACKSETS = ("AWSControlTowerExecutionRole",)
+# So the instance state is the wrong thing to judge. Whether the role actually exists and is
+# assumable is answered by check_member_execution_roles (--check-member-roles), which assumes
+# into each account instead of inferring from a stack instance.
+#
+# Deliberately narrow: only this StackSet. A failure on a *baseline* StackSet is a real
+# problem, and an "already exists" collision there usually means a previously deleted
+# StackSet left resources behind — a common cause of repair failures on a broken landing zone.
+_UNRELIABLE_FAILURE_STACKSETS = ("AWSControlTowerExecutionRole",)
+
+# The one failure reason that is positively benign: the role Control Tower wanted to create
+# is already there. Any other reason on the same StackSet is still not a blocker, but it is
+# unexplained and worth a look rather than silence.
+_BENIGN_FAILURE_REASON = "already exists"
 
 
-def _is_expected_instance_failure(stackset: str, reason: str) -> bool:
-    """True when a FAILED stack instance is a known-harmless collision, not a problem."""
-    return (stackset in _EXPECTED_FAILURE_STACKSETS
-            and "already exists" in (reason or "").lower())
+def _is_unreliable_failure_signal(stackset: str) -> bool:
+    """True when a failed stack instance on this StackSet does not indicate a real problem."""
+    return stackset in _UNRELIABLE_FAILURE_STACKSETS
 
 
 def _short_reason(text: str, limit: int = 100) -> str:
@@ -946,7 +971,8 @@ def check_stacksets(ctx: Context, report: Report) -> None:
     # afterward (Re-register OU). So only shared-account instances are hard blockers.
     shared = ctx.shared_accounts
 
-    shared_bad, member_bad, outdated, orphaned, expected = [], [], [], [], []
+    shared_bad, member_bad, outdated, orphaned = [], [], [], []
+    expected, unexplained = [], []
     skipped: List[List[str]] = []
     for name in names:
         try:
@@ -979,11 +1005,17 @@ def check_stacksets(ctx: Context, report: Report) -> None:
                       or detailed in ("FAILED", "INOPERABLE", "CANCELLED")
                       or drift_bad)
             if is_bad:
-                # Severity follows the failure REASON, not the account tier. An expected
-                # "already exists" collision is not a finding in any account. Drift is
-                # never excused this way — a drifted instance is a real difference.
-                if not drift_bad and _is_expected_instance_failure(name, reason):
-                    expected.append(row + [_short_reason(reason)])
+                # Severity follows the failure REASON and the StackSet, not the account tier.
+                # A failed instance on AWSControlTowerExecutionRole is never a blocker in any
+                # account, because the instance state does not tell you whether the role
+                # exists. Drift is not excused this way — a drifted instance is a real
+                # difference between the deployed stack and its template.
+                if not drift_bad and _is_unreliable_failure_signal(name):
+                    # Decide this on the FULL reason. _short_reason truncates for display and
+                    # would cut the tail off a long CloudFormation reason string.
+                    _bucket = (expected if _BENIGN_FAILURE_REASON in reason.lower()
+                               else unexplained)
+                    _bucket.append(row + [_short_reason(reason)])
                 else:
                     (shared_bad if acct in shared else member_bad).append(
                         row + [_short_reason(reason)])
@@ -1017,22 +1049,28 @@ def check_stacksets(ctx: Context, report: Report) -> None:
                            rows=member_bad,
                            remediation="Reconcile (repair/revert) before you update or re-register that "
                                        "account's OU."))
-    if expected:
-        report.add(Finding("stacksets_expected", INFO,
-                           f"{len(expected)} StackSet instance(s) failed with an expected "
-                           "\"already exists\" collision",
-                           "These are instances of the AWSControlTowerExecutionRole StackSet, which "
-                           "deploys the AWSControlTowerExecution role when an OU is registered. The "
-                           "role was already present in these accounts — commonly because AWS "
-                           "Organizations created it with the account, or someone created it by hand "
-                           "— so the instance failed while the end state Control Tower wanted (the "
-                           "role exists) is already true. Expected, and does NOT block a "
-                           "landing-zone update or OU registration. Environments with hundreds of "
-                           "these upgrade normally.",
+    if expected or unexplained:
+        _rows = expected + unexplained
+        report.add(Finding("stacksets_expected", WARNING if unexplained else INFO,
+                           f"{len(_rows)} AWSControlTowerExecutionRole instance(s) failed"
+                           + (f", {len(unexplained)} for a reason other than an expected collision"
+                              if unexplained else " with an expected \"already exists\" collision"),
+                           "This StackSet deploys the AWSControlTowerExecution role when an OU "
+                           "is registered. The role is frequently already present — AWS "
+                           "Organizations creates it with the account — so the instance fails "
+                           "while the end state Control Tower wanted is already true. Failed "
+                           "instances here are expected, are not a landing-zone-update or OU "
+                           "registration blocker in any account, and do NOT show that the role "
+                           "is missing: the instance state is not a reliable signal either way. "
+                           + ("Some failed for another reason, which is worth understanding even "
+                              "though it still does not block an update. " if unexplained else ""),
                            cols=["StackSet", "Account", "Region", "Status", "Drift", "Reason"],
-                           rows=expected,
-                           remediation="No action needed. Deleting the role to \"fix\" this would "
-                                       "break Control Tower's access to the account."))
+                           rows=_rows,
+                           remediation="Do not delete the role to \"fix\" this — that would break "
+                                       "Control Tower's access to the account. To confirm the role "
+                                       "really exists and is assumable, re-run with "
+                                       "--check-member-roles, which assumes into each account "
+                                       "instead of inferring from stack-instance state."))
     if orphaned:
         report.add(Finding("stacksets_orphaned", INFO,
                            f"{len(orphaned)} stale StackSet instance(s) target accounts no longer in the org",
@@ -1054,7 +1092,7 @@ def check_stacksets(ctx: Context, report: Report) -> None:
                                "template. No inoperable/failed/drifted instances were found.",
                                cols=["StackSet", "Account", "Region", "Status", "Drift"],
                                rows=outdated))
-        elif not orphaned and not expected:
+        elif not orphaned and not expected and not unexplained:
             report.add(Finding("stacksets", PASS,
                                f"All instances CURRENT across {len(names)} AWSControlTower "
                                f"StackSet(s){_scope_suffix(skipped)}"))
@@ -2342,6 +2380,9 @@ def check_provisioned_product_health(ctx: Context, report: Report) -> None:
         report.add(Finding("provisioned_products", UNKNOWN,
                            "Could not search Account Factory provisioned products", str(e)))
         return
+    # Judge only the products Account Factory created. Unrelated Service Catalog products in
+    # the management account have no bearing on a landing-zone update or on re-baselining.
+    pps = _account_factory_products(pps)
     bad = [p for p in pps if p.get("Status") in ("ERROR", "TAINTED")]
     inprog = [p for p in pps if p.get("Status") in ("UNDER_CHANGE", "PLAN_IN_PROGRESS")]
     if bad:
@@ -2367,7 +2408,9 @@ def check_provisioned_product_health(ctx: Context, report: Report) -> None:
                            remediation="Wait for the Account Factory operation to complete."))
     if not bad and not inprog:
         report.add(Finding("provisioned_products", PASS,
-                           f"All {len(pps)} Account Factory provisioned product(s) are healthy"))
+                           f"All {len(pps)} Account Factory provisioned product(s) are healthy"
+                           if pps else
+                           "No Account Factory provisioned products found"))
 
 
 # Landing zone 4.0 service-integration dependency rules.
@@ -2910,12 +2953,29 @@ def main() -> int:
     ctx.check_kms_policy = args.check_kms_policy
     ctx.check_orphaned_resources = args.check_orphaned_resources
 
-    for check in CHECKS:
+    # Progress goes to stderr, never stdout: stdout carries the report, which is piped and
+    # redirected. Without it a run looks hung — it makes hundreds of API calls and can take
+    # a few minutes on a large organization.
+    _tty = sys.stderr.isatty()
+    _total = len(CHECKS)
+    print(f"Running {_total} pre-upgrade checks against the landing zone in {region}. "
+          f"This usually takes one to three minutes.", file=sys.stderr)
+    for _i, check in enumerate(CHECKS, 1):
+        _label = check.__name__.replace("check_", "").replace("_", " ")
+        if _tty:
+            # Redraw one line rather than scrolling 30.
+            print(f"\r  [{_i:2d}/{_total}] {_label:<44.44}", end="", file=sys.stderr, flush=True)
+        else:
+            print(f"  [{_i:2d}/{_total}] {_label}", file=sys.stderr, flush=True)
         try:
             check(ctx, report)
         except Exception as e:  # a check must never crash the gate
             report.add(Finding(check.__name__, UNKNOWN,
                                f"Check '{check.__name__}' errored", repr(e)))
+    if _tty:
+        print(f"\r  {_total} checks complete.{' ' * 40}", file=sys.stderr, flush=True)
+    else:
+        print(f"  {_total} checks complete.", file=sys.stderr, flush=True)
 
     print(render_text(report, ctx, use_color))
     if args.json:

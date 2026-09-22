@@ -158,9 +158,46 @@ class TestBlockerPaths(unittest.TestCase):
             {"Id": "333333333333", "Name": "closed", "Status": "SUSPENDED"}]}})
         sc = FakeClient({"search_provisioned_products": {"ProvisionedProducts": [
             {"Name": "account-333333333333-abc", "Status": "AVAILABLE",
+             "Type": "CONTROL_TOWER_ACCOUNT",
              "PhysicalId": "arn:aws:...:333333333333"}]}})
         ctx = make_ctx({"organizations": orgs, "servicecatalog": sc})
         self.assertIn(ct.BLOCKER, levels(_run(ct.check_suspended_with_provisioned_product, ctx)))
+
+    def test_unrelated_product_for_suspended_account_is_not_a_blocker(self):
+        # The management account's Service Catalog holds products Control Tower does not own.
+        # One that merely mentions a suspended account id must not raise a BLOCKER.
+        orgs = FakeClient({"list_accounts": {"Accounts": [
+            {"Id": "333333333333", "Name": "closed", "Status": "SUSPENDED"}]}})
+        sc = FakeClient({"search_provisioned_products": {"ProvisionedProducts": [
+            {"Name": "my-app-stack", "Status": "AVAILABLE", "Type": "CFN_STACK",
+             "PhysicalId": "arn:aws:...:333333333333"}]}})
+        ctx = make_ctx({"organizations": orgs, "servicecatalog": sc})
+        self.assertNotIn(ct.BLOCKER, levels(_run(ct.check_suspended_with_provisioned_product, ctx)))
+
+    def test_unrelated_provisioned_product_types_are_not_reported(self):
+        # Reported by an SME: unhealthy CFN_STACK and TERRAFORM_OPEN_SOURCE products were
+        # being counted as Account Factory failures. On one organization 31 of 32 unhealthy
+        # products were unrelated, so this has to filter on type, not just status.
+        sc = FakeClient({"search_provisioned_products": {"ProvisionedProducts": [
+            {"Name": "app-1", "Status": "TAINTED", "Type": "CFN_STACK"},
+            {"Name": "app-2", "Status": "ERROR", "Type": "TERRAFORM_OPEN_SOURCE"},
+            {"Name": "app-3", "Status": "ERROR", "Type": "CFN_STACKSET"}]}})
+        ctx = make_ctx({"servicecatalog": sc})
+        lv = levels(_run(ct.check_provisioned_product_health, ctx))
+        self.assertIn(ct.PASS, lv)
+        self.assertNotIn(ct.WARNING, lv)
+
+    def test_account_factory_failure_still_reported_alongside_unrelated_ones(self):
+        # The filter must not hide a genuine Account Factory failure sitting next to noise.
+        sc = FakeClient({"search_provisioned_products": {"ProvisionedProducts": [
+            {"Name": "app-1", "Status": "TAINTED", "Type": "CFN_STACK"},
+            {"Name": "acct-real", "Status": "TAINTED", "Type": "CONTROL_TOWER_ACCOUNT"}]}})
+        ctx = make_ctx({"servicecatalog": sc})
+        findings = _run(ct.check_provisioned_product_health, ctx).findings
+        warn = [f for f in findings if f.level == ct.WARNING]
+        self.assertTrue(warn, "a real Account Factory failure must still be reported")
+        self.assertIn("1 Account Factory", warn[0].summary)
+        self.assertEqual([r[0] for r in warn[0].rows], ["acct-real"])
 
     # 6. enabled controls drift ----------------------------------------------------
     def test_enabled_controls_drift_warns_not_blocks(self):
@@ -364,14 +401,39 @@ class TestBlockerPaths(unittest.TestCase):
         self.assertNotIn(ct.WARNING, lv)
         self.assertNotIn(ct.BLOCKER, lv)
 
-    def test_execution_role_failure_for_another_reason_still_blocks(self):
-        # Only the "already exists" collision is expected. Any other failure on the same
-        # StackSet is a real problem and must keep its severity.
+    def test_benign_reason_longer_than_the_display_limit_still_reads_as_benign(self):
+        # The real CloudFormation reason is ~138 characters and "already exists" sits at the
+        # very end, past the 100-character display truncation. Classifying from the truncated
+        # display string silently turned every real benign collision into a WARNING.
+        self.assertGreater(len(self.ALREADY_EXISTS), 100, "fixture must exceed the display limit")
+        orgs = FakeClient({"list_accounts": {"Accounts": [{"Id": "111111111111", "Status": "ACTIVE"}]}})
+        ctx = make_ctx({"cloudformation": self._exec_role_instance("111111111111", self.ALREADY_EXISTS),
+                        "organizations": orgs})
+        lv = levels(_run(ct.check_stacksets, ctx))
+        self.assertIn(ct.INFO, lv)
+        self.assertNotIn(ct.WARNING, lv)
+        self.assertNotIn(ct.BLOCKER, lv)
+
+    def test_execution_role_failure_for_another_reason_warns_but_never_blocks(self):
+        # The instance state on this StackSet is not a reliable signal, so no reason makes it
+        # a blocker. An unexplained failure is still surfaced as a WARNING rather than hidden.
         orgs = FakeClient({"list_accounts": {"Accounts": [{"Id": "111111111111", "Status": "ACTIVE"}]}})
         ctx = make_ctx({"cloudformation": self._exec_role_instance(
             "111111111111", "AccessDenied: not authorized to perform iam:CreateRole"),
             "organizations": orgs})
-        self.assertIn(ct.BLOCKER, levels(_run(ct.check_stacksets, ctx)))
+        lv = levels(_run(ct.check_stacksets, ctx))
+        self.assertIn(ct.WARNING, lv)
+        self.assertNotIn(ct.BLOCKER, lv)
+
+    def test_execution_role_never_blocks_whatever_the_reason(self):
+        # Guards the SME's finding directly: two independent Control Tower authorities state
+        # failures on this StackSet do not block an update, so nothing here may reach BLOCKER.
+        orgs = FakeClient({"list_accounts": {"Accounts": [{"Id": "111111111111", "Status": "ACTIVE"}]}})
+        for reason in (self.ALREADY_EXISTS, "AccessDenied", "Throttled", "", "some novel error"):
+            ctx = make_ctx({"cloudformation": self._exec_role_instance("111111111111", reason),
+                            "organizations": orgs})
+            lv = levels(_run(ct.check_stacksets, ctx))
+            self.assertNotIn(ct.BLOCKER, lv, f"blocked on reason: {reason!r}")
 
     def test_baseline_stackset_already_exists_still_blocks(self):
         # The exemption is deliberately narrow. An "already exists" collision on a

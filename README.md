@@ -262,6 +262,11 @@ color-independent fallback. Color is applied only when the output is an interact
 redirected, when `--color never` is used, or when the `NO_COLOR` environment variable is set. The
 `--json` report is never colorized.
 
+A run makes hundreds of API calls and takes one to three minutes on a large organization, so it
+prints its progress — a count of checks completed — to **stderr** while it works. The report
+itself goes to stdout, so piping, redirecting and `--json` are unaffected; redirect stderr to
+`/dev/null` if you want the progress gone.
+
 ### Exit codes (for pipeline gating)
 
 | Code | Meaning |

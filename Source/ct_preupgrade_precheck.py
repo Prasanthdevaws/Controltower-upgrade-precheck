@@ -7,46 +7,52 @@ PURPOSE
 Run this from the AWS Control Tower MANAGEMENT account, in the HOME region, BEFORE
 you click "Update"/"Repair"/"Reset" on the landing zone (or call UpdateLandingZone /
 ResetLandingZone). It confirms the environment is in a known-good state and surfaces the
-issues, drift, out-of-band changes and customizations that are the documented causes of
-landing-zone update failures — so they can be fixed first.
+issues, drift, out-of-band changes and customizations that are documented or repeatedly
+observed causes of landing-zone update failures — so they can be fixed first.
 
 It is read-only by default: every AWS call on the default path is a List*/Get*/Describe*/
-Search*, and it never mutates
-anything. It exits non-zero if any BLOCKER is found so you can gate an upgrade runbook on it.
+Search*, and nothing is mutated. The one exception is --detect-drift, which starts a
+CloudFormation drift-detection operation. It exits non-zero when a BLOCKER is found, and
+also when a check could not be evaluated, so an upgrade runbook can gate on it.
 
-WHAT IT CHECKS  (each mapped to a documented LZ-update failure cause; see README.md)
-    1.  Landing zone status is ACTIVE (not FAILED / PROCESSING / mid-operation)
-    2.  Landing zone drift status is IN_SYNC          (out-of-band change / managed-SCP edit)
-    3.  Landing zone is actually behind (an update is available) + version delta
-    4.  Managed accounts: none FAILED / SUSPENDED / mid-provisioning
-    5.  Suspended/closed accounts that still have an Account Factory provisioned product
-        (the classic "AWSControlTowerExecution role can't be assumed" upgrade blocker)
-    6.  Enabled CONTROLS drift / non-SUCCEEDED status across every registered OU
-    7.  Enabled BASELINES drift / non-SUCCEEDED status (incl. child accounts)
-    8.  AWSControlTower* StackSets: failed/outdated/drifted stack instances, orphaned instances
-    9.  AWS Config recorders/delivery channels present in the Audit & Log Archive accounts
-        and any default recorder in non-home governed regions (blocks the update)
-    10. Customizations detected (CfCT, AFT, custom StackSets targeting governed regions)
-    11. Required trusted (service) access enabled in AWS Organizations
-    12. Delegated administrators inventory (conflicts with CFN StackSets / Config)
-    13. Required Control Tower management-account IAM roles exist
-    14. Landing-zone KMS key is ENABLED (not disabled / pending deletion)
-    15. STS is activated in the management account for every governed Region
-    16. SCP headroom (10-SCP-per-target limit) + customer-managed SCP inventory
-    17. SCP content risk: FullAWSAccess detached, or a custom Deny that doesn't exempt
-        AWSControlTowerExecution / restricts Regions via SCP (can block the update)
-    18. No in-progress (RUNNING/STOPPING/QUEUED) operations on AWSControlTower* StackSets
-        (a concurrent StackSet operation conflicts with the landing-zone update)
-    19. Foundational AWSControlTower StackSets exist (missing baseline StackSets = a broken /
-        partially-deleted landing zone that must be repaired, not upgraded)
-    20. Account Factory provisioned products are healthy (ERROR/TAINTED = failed enrollment
-        that blocks updates; UNDER_CHANGE/PLAN_IN_PROGRESS = operation mid-flight)
+WHAT IT CHECKS
+    30 checks, most on by default and a few behind an opt-in flag. The authoritative
+    per-check table — what each one detects, its data source and its severity — is in
+    README.md, and the executable list is CHECKS near the bottom of this file. Both track
+    the code, so prefer them to this summary.
 
-    Severity model: only issues in the shared accounts (management, log archive, audit) and
-    org-level config hard-BLOCK the landing-zone update; the same issue in a *member* account
-    is a WARNING (the LZ update acts on shared accounts first; members re-baseline separately).
-    With --detect-drift, active CloudFormation StackSet drift detection runs and owns DRIFTED
-    reporting (the stored-status check defers to it to avoid double-counting).
+    Landing zone state     status ACTIVE, drift IN_SYNC, whether an update is available,
+                           and the version-specific changes on the path to the target
+    Accounts               suspended or failed managed accounts, a suspended account still
+                           holding an Account Factory product (the classic "cannot assume
+                           AWSControlTowerExecution" blocker), provisioned-product health
+    Controls and baselines control drift, baseline drift, and baselines still targeting an
+                           OU that no longer exists in AWS Organizations
+    StackSets              AWSControlTower* stack-instance health, foundational StackSets
+                           missing entirely, in-progress operations that would conflict,
+                           and active drift detection (opt-in)
+    Shared-account state   AWS Config recorders and delivery channels Control Tower did not
+                           create, and CT-created resources orphaned by a deleted StackSet
+                           that collide with "already exists" on Repair/Reset
+    Organization config    trusted service access, delegated administrators, SCP headroom
+                           against the 10-per-target limit, and SCP content that fails to
+                           exempt AWSControlTowerExecution or restricts Regions
+    Landing zone 4.0       the CloudTrail managed-policy prerequisite, service-integration
+    prerequisites          accounts sharing one parent OU, the integration dependency
+                           rules, and IAM Identity Center being in the home Region
+    Identity and keys      required management-account IAM roles, the landing-zone KMS key
+                           against every requirement one DescribeKey can decide, its key
+                           policy (opt-in), STS activation in each governed Region, and
+                           AWSControlTowerExecution in every enrolled account (opt-in)
+
+    Severity model: only problems in the shared accounts — management, log archive, audit,
+    and the 4.0 service-integration accounts — and in org-level configuration hard-BLOCK a
+    landing-zone update. The same problem in a *member* account is a WARNING, because the
+    update acts on the shared accounts and enrolled accounts are re-baselined separately by
+    re-registering their OU. A failure whose reason shows Control Tower's intended end state
+    is already true is not reported as a problem at all. With --detect-drift, active
+    CloudFormation drift detection runs and owns DRIFTED reporting, and the stored-status
+    check defers to it rather than counting the same instance twice.
 
 USAGE
 -----
@@ -56,24 +62,23 @@ USAGE
     # Explicit region / profile:
     python3 ct_preupgrade_precheck.py --region us-east-1 --profile my-mgmt-admin
 
-    # JSON report for a pipeline gate, and treat warnings/unknowns as blocking:
+    # JSON report for a pipeline gate, and fail on warnings too:
     python3 ct_preupgrade_precheck.py --json report.json --strict
 
     # Cross-account Config check needs a role assumable in the shared accounts
     # (defaults to AWSControlTowerExecution, which the mgmt account can assume):
     python3 ct_preupgrade_precheck.py --member-role AWSControlTowerExecution
 
-    # Opt-in deeper checks (slower / assume into accounts):
-    #   --detect-drift             actively run StackSet drift detection
-    #   --check-member-roles       verify AWSControlTowerExecution in every enrolled account
-    #   --check-kms-policy         heuristically verify the landing-zone CMK key policy
-    #   --check-orphaned-resources (broken LZ) find CT roles that will collide on Repair/Reset
-    python3 ct_preupgrade_precheck.py --check-orphaned-resources
+    # Opt-in deeper checks, slower or assuming into accounts. Compose as needed; each is
+    # described in the README's opt-in table:
+    python3 ct_preupgrade_precheck.py --detect-drift --check-member-roles \
+                                      --check-kms-policy --check-orphaned-resources
 
 EXIT CODES
-    0 = no blockers (safe to proceed, review warnings)
-    2 = one or more BLOCKERS (do NOT upgrade until resolved)
-    3 = precheck could not run (auth/permup problem)
+    0 = no blockers, and every check ran (review any warnings)
+    2 = one or more BLOCKERS, or one or more checks could not be evaluated (UNKNOWN).
+        --allow-unknown exits 0 on unevaluated checks; --strict also fails on WARNING
+    3 = the precheck could not run (authentication or setup problem)
 
 REQUIRED PERMISSIONS (management account, read-only)
     controltower:ListLandingZones, GetLandingZone, ListEnabledControls, ListEnabledBaselines
@@ -86,6 +91,7 @@ REQUIRED PERMISSIONS (management account, read-only)
                    DescribeStackSetOperation, DescribeStackResourceDrifts
     iam:GetRole, ListAttachedRolePolicies
     kms:DescribeKey, GetKeyPolicy
+    sso:ListInstances (IAM Identity Center home-Region prerequisite check)
     sts:GetCallerIdentity, AssumeRole (AssumeRole only for the cross-account Config check)
 
     OPT-IN, STATE-CHANGING (only with --detect-drift)
@@ -2921,7 +2927,19 @@ def main() -> int:
         # names and verbatim API error strings, so create it 0600 (not world-readable at the
         # default umask) and refuse to follow a symlink rather than clobber its target.
         _flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
-        with os.fdopen(os.open(args.json, _flags, 0o600), "w") as fh:
+        _fd = os.open(args.json, _flags, 0o600)
+        # os.open applies that mode ONLY when it creates the file. An existing report.json
+        # keeps whatever permissions it already had, so a second run would leave a
+        # world-readable file. Set it explicitly. fchmod acts on the open descriptor, so
+        # the path cannot be swapped between the open and the permission change.
+        if hasattr(os, "fchmod"):
+            try:
+                os.fchmod(_fd, 0o600)
+            except OSError as e:
+                # Writable but not chmod-able means someone else owns it - say so rather
+                # than silently produce a file without the protection F-05 asks for.
+                print(f"WARNING: could not restrict permissions on {args.json}: {e}")
+        with os.fdopen(_fd, "w") as fh:
             json.dump({"findings": [_as_dict(f) for f in report.findings]}, fh, indent=2)
         print(f"\nJSON report written to {args.json}")
 

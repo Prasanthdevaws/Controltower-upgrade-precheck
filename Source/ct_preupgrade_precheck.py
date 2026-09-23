@@ -177,6 +177,7 @@ _CHECK_DOCS = {
     "stacksets": f"{DOC}/drift.html",
     "stacksets_member": f"{DOC}/drift.html",
     "stacksets_expected": f"{DOC}/drift.html",
+    "stacksets_drifted": f"{DOC}/resolve-drift.html",
     "stacksets_orphaned": f"{DOC}/shared-account-resources.html",
     "stackset_drift": f"{DOC}/drift.html",
     "stackset_drift_member": f"{DOC}/drift.html",
@@ -972,7 +973,7 @@ def check_stacksets(ctx: Context, report: Report) -> None:
     shared = ctx.shared_accounts
 
     shared_bad, member_bad, outdated, orphaned = [], [], [], []
-    expected, unexplained = [], []
+    expected, unexplained, drifted = [], [], []
     skipped: List[List[str]] = []
     for name in names:
         try:
@@ -1001,16 +1002,22 @@ def check_stacksets(ctx: Context, report: Report) -> None:
                 orphaned.append(row)
                 continue
             drift_bad = (drift == "DRIFTED" and not getattr(ctx, "detect_drift", False))
-            is_bad = (status == "INOPERABLE"
-                      or detailed in ("FAILED", "INOPERABLE", "CANCELLED")
-                      or drift_bad)
-            if is_bad:
+            # A failed/inoperable instance and a drifted one are different signals with
+            # different severities, so they are classified separately. A hard failure wins
+            # when an instance is both.
+            hard_bad = (status == "INOPERABLE"
+                        or detailed in ("FAILED", "INOPERABLE", "CANCELLED"))
+            # Drift and failure are independent facts about the same instance, so a drifted
+            # instance is recorded even when it also failed — otherwise a benign collision
+            # would swallow a real out-of-band change.
+            if drift_bad:
+                drifted.append(row + [_short_reason(reason)])
+            if hard_bad:
                 # Severity follows the failure REASON and the StackSet, not the account tier.
                 # A failed instance on AWSControlTowerExecutionRole is never a blocker in any
                 # account, because the instance state does not tell you whether the role
-                # exists. Drift is not excused this way — a drifted instance is a real
-                # difference between the deployed stack and its template.
-                if not drift_bad and _is_unreliable_failure_signal(name):
+                # exists.
+                if _is_unreliable_failure_signal(name):
                     # Decide this on the FULL reason. _short_reason truncates for display and
                     # would cut the tail off a long CloudFormation reason string.
                     _bucket = (expected if _BENIGN_FAILURE_REASON in reason.lower()
@@ -1019,16 +1026,16 @@ def check_stacksets(ctx: Context, report: Report) -> None:
                 else:
                     (shared_bad if acct in shared else member_bad).append(
                         row + [_short_reason(reason)])
-            elif status == "OUTDATED":
+            elif not drift_bad and status == "OUTDATED":
                 # Behind the current template. NOT refreshed by the landing-zone update itself —
                 # enrolled accounts are updated separately, by re-registering/resetting the OU.
                 outdated.append(row)
     _report_partial_scope(report, "stacksets", "AWSControlTower StackSet(s)", skipped)
     if shared_bad:
         report.add(Finding("stacksets", BLOCKER,
-                           f"{len(shared_bad)} AWSControlTower* StackSet instance(s) inoperable/failed/"
-                           "drifted in shared accounts",
-                           "INOPERABLE/FAILED or DRIFTED instances in the management account or a "
+                           f"{len(shared_bad)} AWSControlTower* StackSet instance(s) inoperable/failed "
+                           "in shared accounts",
+                           "INOPERABLE/FAILED instances in the management account or a "
                            "service-integration account (Audit, Log archive, Config, Backup) block "
                            "the landing-zone update — Control Tower manages those accounts through "
                            "the landing zone, so they are exactly what the update/repair/reset "
@@ -1039,8 +1046,8 @@ def check_stacksets(ctx: Context, report: Report) -> None:
                                        "instances before upgrading."))
     if member_bad:
         report.add(Finding("stacksets_member", WARNING,
-                           f"{len(member_bad)} AWSControlTower* StackSet instance(s) inoperable/failed/"
-                           "drifted in member accounts",
+                           f"{len(member_bad)} AWSControlTower* StackSet instance(s) inoperable/failed "
+                           "in member accounts",
                            "These are in member (non-shared) accounts. A landing-zone update/repair/reset "
                            "acts on the shared accounts first and does not touch member accounts, so this "
                            "does NOT block the landing-zone update. It can, however, affect that account "
@@ -1071,6 +1078,29 @@ def check_stacksets(ctx: Context, report: Report) -> None:
                                        "really exists and is assumable, re-run with "
                                        "--check-member-roles, which assumes into each account "
                                        "instead of inferring from stack-instance state."))
+    if drifted:
+        report.add(Finding("stacksets_drifted", WARNING,
+                           f"{len(drifted)} AWSControlTower* StackSet instance(s) report "
+                           "DRIFTED",
+                           "Stored drift status on Control Tower's own StackSet instances. This "
+                           "is a repairable change, not one of the four drift types "
+                           "drift.html says to resolve right away, and on landing zone 3.1 and "
+                           "later \"drift is resolved as part of the update process\" "
+                           "(resolve-drift.html) — a landing-zone update was observed "
+                           "succeeding with drifted instances present in a shared account. So "
+                           "this does not block the update, in any account. It is still worth "
+                           "reconciling: the update resolves drift by reasserting Control "
+                           "Tower's intent, which means an out-of-band change you wanted to "
+                           "keep is the thing that gets reverted. The drift types that DO block "
+                           "are covered separately — missing required IAM roles (check 13) and "
+                           "in-progress StackSet operations (check 18).",
+                           cols=["StackSet", "Account", "Region", "Status", "Drift", "Reason"],
+                           rows=drifted,
+                           remediation="Review what changed out of band and decide whether to "
+                                       "revert it or update the StackSet to match, before the "
+                                       "upgrade reasserts Control Tower's version. Run with "
+                                       "--detect-drift for resource-level detail; stored status "
+                                       "is only as fresh as the last detection."))
     if orphaned:
         report.add(Finding("stacksets_orphaned", INFO,
                            f"{len(orphaned)} stale StackSet instance(s) target accounts no longer in the org",
@@ -1080,7 +1110,7 @@ def check_stacksets(ctx: Context, report: Report) -> None:
                            cols=["StackSet", "Account", "Region", "Status", "Drift"], rows=orphaned,
                            remediation="Optionally delete these stale instances "
                                        "(DeleteStackInstances with RetainStacks) to tidy up."))
-    if not shared_bad and not member_bad:
+    if not shared_bad and not member_bad and not drifted:
         if outdated:
             report.add(Finding("stacksets", INFO,
                                f"{len(outdated)} StackSet instance(s) are OUTDATED (expected)",
@@ -1127,6 +1157,16 @@ def _resource_drift_detail(ctx: "Context", acct: str, region: str, stack_id) -> 
     return "; ".join(parts) + ("" if len(drifts) <= 5 else f" (+{len(drifts) - 5} more)")
 
 
+def _progress(msg: str) -> None:
+    """Transient progress to stderr. stdout carries only the report, so a caller piping or
+    redirecting output, or reading --json, is unaffected. On a terminal this redraws one
+    line; otherwise it writes plain lines, which is what a CI log wants."""
+    if sys.stderr.isatty():
+        print(f"\r  {msg:<74.74}", end="", file=sys.stderr, flush=True)
+    else:
+        print(f"  {msg}", file=sys.stderr, flush=True)
+
+
 def check_stackset_active_drift(ctx: Context, report: Report) -> None:
     """OPT-IN (--detect-drift): actively run CloudFormation StackSet drift detection on
     the AWSControlTower* StackSets to catch out-of-band changes to CT-deployed stack
@@ -1158,9 +1198,23 @@ def check_stackset_active_drift(ctx: Context, report: Report) -> None:
     except (ClientError, BotoCoreError):
         org_ids = None
 
+    # One shared budget across all StackSets, not per StackSet: a precheck that can run for
+    # an unbounded time is useless in a pipeline. The loop below must therefore check it
+    # BEFORE starting each detection, or it would fire a real CloudFormation operation and
+    # then abandon it immediately, reporting a timeout it never had a chance to beat.
     deadline = time.time() + getattr(ctx, "drift_timeout", 900)
     failed = []
-    for name in names:
+    in_flight = []  # operations known to be still running when the budget ran out
+    for _n, name in enumerate(names, 1):
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            # Budget spent. Do not start this one at all.
+            failed.append([name, "not_started",
+                           "the --drift-timeout budget was spent on earlier StackSets; "
+                           "no operation was started for this one"])
+            continue
+        _progress(f"drift detection [{_n}/{len(names)}] {name} "
+                  f"({int(remaining)}s of budget left)")
         try:
             op = cfn.detect_stack_set_drift(StackSetName=name)["OperationId"]
         except (ClientError, BotoCoreError) as e:
@@ -1178,11 +1232,14 @@ def check_stackset_active_drift(ctx: Context, report: Report) -> None:
                     failed.append([name, f"operation_{st}", ""])
                 break
             if time.time() > deadline:
+                in_flight.append(name)
                 failed.append([name, "timeout",
                                "still running at timeout; deliberately not stopped - see the "
                                "finding detail and check #18 below"])
                 break
-            time.sleep(10)
+            # Never sleep past the budget: otherwise each StackSet can overshoot it by a
+            # whole poll interval, and with several StackSets that adds up.
+            time.sleep(max(0.0, min(10.0, deadline - time.time())))
 
     shared = ctx.shared_accounts
     shared_drifted, member_drifted, orphaned_drifted = [], [], []
@@ -1210,19 +1267,25 @@ def check_stackset_active_drift(ctx: Context, report: Report) -> None:
             (shared_drifted if acct in shared else member_drifted).append(row)
 
     if shared_drifted:
-        report.add(Finding("stackset_drift", BLOCKER,
+        report.add(Finding("stackset_drift", WARNING,
                            f"{len(shared_drifted)} AWSControlTower* StackSet instance(s) DRIFTED in "
                            "shared accounts (out-of-band changes)",
-                           "Active drift detection found resource-level drift in CT-deployed stacks in "
-                           "the management account or a service-integration account (Audit, Log "
-                           "archive, Config, Backup) — which the landing-zone update/repair/reset "
-                           "acts on. This can fail the update or revert changes. "
-                           "The last column shows the drifted resource(s) when the role is assumable, "
-                           "else where to look.",
+                           "Active drift detection found resource-level drift in CT-deployed stacks "
+                           "in the management account or a service-integration account (Audit, Log "
+                           "archive, Config, Backup). This does NOT block the update: drift.html "
+                           "lists four drift types to resolve right away and resource drift inside "
+                           "a StackSet is not among them, and on landing zone 3.1 and later "
+                           "\"drift is resolved as part of the update process\" "
+                           "(resolve-drift.html) — a landing-zone update was observed succeeding "
+                           "with drifted instances present in a shared account. Reconcile it "
+                           "anyway, and before the upgrade: the update resolves drift by "
+                           "reasserting Control Tower's intent, so an out-of-band change you "
+                           "meant to keep is what gets reverted. The last column shows the "
+                           "drifted resource(s) when the role is assumable, else where to look.",
                            cols=["StackSet", "Account", "Region", "Status", "Drift",
                                  "Drifted resources / where to look"], rows=shared_drifted,
-                           remediation="Reconcile the out-of-band changes (revert them, or update the "
-                                       "StackSet to match) before upgrading."))
+                           remediation="Decide per resource whether to revert the out-of-band "
+                                       "change or update the StackSet to match, before upgrading."))
     if member_drifted:
         report.add(Finding("stackset_drift_member", WARNING,
                            f"{len(member_drifted)} AWSControlTower* StackSet instance(s) DRIFTED in "
@@ -1242,25 +1305,39 @@ def check_stackset_active_drift(ctx: Context, report: Report) -> None:
                            cols=["StackSet", "Account", "Region", "Status", "Drift"],
                            rows=orphaned_drifted))
     if failed:
+        _not_started = [r[0] for r in failed if r[1] == "not_started"]
+        _detail = (
+            "Their drift state is unverified (detection failed, timed out, or was never "
+            "started).\n"
+            "--drift-timeout is one budget shared across all StackSets, not a per-StackSet "
+            "allowance. When it runs out, remaining StackSets are listed as 'not_started' "
+            "and no operation is launched for them, so nothing is reported as a timeout it "
+            "never had a chance to beat. Raise --drift-timeout to cover them.\n"
+            "A timeout does NOT stop an operation that had already started, and that is "
+            "deliberate: drift detection makes no changes to your resources and finishes on "
+            "its own, whereas calling StopStackSetOperation would leave the StackSet in "
+            "STOPPING - a state that blocks a landing-zone update exactly as RUNNING does. "
+            "Control Tower cannot update a landing zone while any operation on its StackSets "
+            "is in progress, so an operation still active here is reported as a BLOCKER by "
+            "check #18 (in-progress StackSet operations), which runs immediately after this "
+            "check in the same invocation. This finding is itself UNKNOWN, which fails the "
+            "exit code by default.")
+        if in_flight:
+            _detail += ("\nStill running when this check gave up, and very likely still "
+                        "running now: " + ", ".join(in_flight) + ". They will finish on "
+                        "their own; re-run the precheck to confirm.")
+        if _not_started:
+            _detail += (f"\nNever started for want of budget: {len(_not_started)} StackSet(s).")
         report.add(Finding("stackset_drift", UNKNOWN,
                            f"Drift detection did not complete for {len(failed)} StackSet(s)",
-                           "Their drift state is unverified (detection failed or timed out).\n"
-                           "A --drift-timeout expiry does NOT stop the operation, and that is "
-                           "deliberate: drift detection makes no changes to your resources and "
-                           "finishes on its own, whereas calling StopStackSetOperation would "
-                           "leave the StackSet in STOPPING - a state that blocks a landing-zone "
-                           "update exactly as RUNNING does. Control Tower cannot update a landing "
-                           "zone while any operation on its StackSets is in progress, so an "
-                           "operation still active here is reported as a BLOCKER by check #18 "
-                           "(in-progress StackSet operations), which runs immediately after this "
-                           "check in the same invocation. This finding is itself UNKNOWN, which "
-                           "fails the exit code by default.",
+                           _detail,
                            cols=["StackSet", "Reason", "Detail"], rows=failed,
-                           remediation="Re-run the precheck to confirm the operation has "
-                                       "finished, or raise --drift-timeout. Do not start the "
-                                       "upgrade while check #18 reports an in-progress "
-                                       "operation, or check StackSet drift-detection "
-                                       "permissions if detection failed outright."))
+                           remediation="Re-run the precheck to confirm any in-flight operation "
+                                       "has finished, and raise --drift-timeout so the budget "
+                                       "covers every StackSet. Do not start the upgrade while "
+                                       "check #18 reports an in-progress operation, or check "
+                                       "StackSet drift-detection permissions if detection "
+                                       "failed outright."))
     if not shared_drifted and not member_drifted and not failed:
         report.add(Finding("stackset_drift", PASS,
                            f"Active drift detection: no drift across {len(names)} "
@@ -2898,7 +2975,9 @@ def main() -> int:
                     help="Actively run CloudFormation StackSet drift detection on "
                          "AWSControlTower* StackSets (slower; launches drift operations)")
     ap.add_argument("--drift-timeout", type=int, default=900,
-                    help="Max seconds to wait for each StackSet drift operation (default 900)")
+                    help="Total seconds budgeted for StackSet drift detection, shared across "
+                         "all StackSets (default 900). StackSets not reached within the budget "
+                         "are reported as not started, not as timeouts")
     ap.add_argument("--check-member-roles", action="store_true",
                     help="Assume into every enrolled account to verify the execution role "
                          "(AWSControlTowerExecution) is present/assumable (slower)")
@@ -2956,26 +3035,20 @@ def main() -> int:
     # Progress goes to stderr, never stdout: stdout carries the report, which is piped and
     # redirected. Without it a run looks hung — it makes hundreds of API calls and can take
     # a few minutes on a large organization.
-    _tty = sys.stderr.isatty()
     _total = len(CHECKS)
     print(f"Running {_total} pre-upgrade checks against the landing zone in {region}. "
           f"This usually takes one to three minutes.", file=sys.stderr)
     for _i, check in enumerate(CHECKS, 1):
         _label = check.__name__.replace("check_", "").replace("_", " ")
-        if _tty:
-            # Redraw one line rather than scrolling 30.
-            print(f"\r  [{_i:2d}/{_total}] {_label:<44.44}", end="", file=sys.stderr, flush=True)
-        else:
-            print(f"  [{_i:2d}/{_total}] {_label}", file=sys.stderr, flush=True)
+        _progress(f"[{_i:2d}/{_total}] {_label}")
         try:
             check(ctx, report)
         except Exception as e:  # a check must never crash the gate
             report.add(Finding(check.__name__, UNKNOWN,
                                f"Check '{check.__name__}' errored", repr(e)))
-    if _tty:
-        print(f"\r  {_total} checks complete.{' ' * 40}", file=sys.stderr, flush=True)
-    else:
-        print(f"  {_total} checks complete.", file=sys.stderr, flush=True)
+    _progress(f"{_total} checks complete.")
+    if sys.stderr.isatty():
+        print("", file=sys.stderr)
 
     print(render_text(report, ctx, use_color))
     if args.json:

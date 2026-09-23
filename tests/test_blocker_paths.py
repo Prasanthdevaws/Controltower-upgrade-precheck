@@ -332,7 +332,11 @@ class TestBlockerPaths(unittest.TestCase):
         self.assertIn(ct.INFO, lv)
         self.assertNotIn(ct.BLOCKER, lv)
 
-    def test_stacksets_drifted_in_shared_blocks(self):
+    def test_stacksets_drifted_in_shared_warns_not_blocks(self):
+        # Stored drift is a repairable change: drift.html's resolve-right-away list does not
+        # include StackSet resource drift, and on 3.1+ "drift is resolved as part of the
+        # update process". A landing-zone update was observed succeeding with drifted
+        # instances present in a shared account.
         cfn = FakeClient({
             "list_stack_sets": {"Summaries": [{"StackSetName": "AWSControlTowerBP-BASELINE-ROLES"}]},
             "list_stack_instances": {"Summaries": [
@@ -341,7 +345,10 @@ class TestBlockerPaths(unittest.TestCase):
         })
         orgs = FakeClient({"list_accounts": {"Accounts": [{"Id": "111111111111", "Status": "ACTIVE"}]}})
         ctx = make_ctx({"cloudformation": cfn, "organizations": orgs})
-        self.assertIn(ct.BLOCKER, levels(_run(ct.check_stacksets, ctx)))
+        lv = levels(_run(ct.check_stacksets, ctx))
+        self.assertIn(ct.WARNING, lv)
+        self.assertNotIn(ct.BLOCKER, lv)
+        self.assertNotIn(ct.PASS, lv, "must not claim all instances are CURRENT")
 
     def test_stacksets_orphaned_account_not_blocker(self):
         # A FAILED/INOPERABLE instance for an account that has LEFT the org is a
@@ -451,13 +458,16 @@ class TestBlockerPaths(unittest.TestCase):
         ctx = make_ctx({"cloudformation": cfn, "organizations": orgs})
         self.assertIn(ct.BLOCKER, levels(_run(ct.check_stacksets, ctx)))
 
-    def test_execution_role_already_exists_but_drifted_still_blocks(self):
-        # Drift is never excused by the reason: a drifted instance is a real difference
-        # between the deployed stack and its template.
+    def test_execution_role_drift_is_reported_separately_from_the_collision(self):
+        # A drifted instance is a real difference from the template, so it is still reported
+        # rather than folded into the benign-collision finding -- as a WARNING, since drift
+        # does not block an update.
         orgs = FakeClient({"list_accounts": {"Accounts": [{"Id": "111111111111", "Status": "ACTIVE"}]}})
         ctx = make_ctx({"cloudformation": self._exec_role_instance(
             "111111111111", self.ALREADY_EXISTS, drift="DRIFTED"), "organizations": orgs})
-        self.assertIn(ct.BLOCKER, levels(_run(ct.check_stacksets, ctx)))
+        lv = levels(_run(ct.check_stacksets, ctx))
+        self.assertIn(ct.WARNING, lv)
+        self.assertNotIn(ct.BLOCKER, lv)
 
     def test_expected_collision_does_not_claim_all_instances_current(self):
         # The PASS line says every instance is CURRENT. An expected collision is not a
@@ -468,13 +478,80 @@ class TestBlockerPaths(unittest.TestCase):
         self.assertNotIn(ct.PASS, levels(_run(ct.check_stacksets, ctx)))
 
     # 8b. Active StackSet drift detection (opt-in --detect-drift) ------------------
+    # 8b-ii. --drift-timeout is one shared budget, and must not be spent starting work ----
+    class _DriftCfn:
+        """Counts detect_stack_set_drift calls; every operation runs forever."""
+
+        def __init__(self, names):
+            self.names = names
+            self.started = []
+
+        def can_paginate(self, op):
+            return False
+
+        def list_stack_sets(self, **k):
+            return {"Summaries": [{"StackSetName": n} for n in self.names]}
+
+        def detect_stack_set_drift(self, StackSetName=None, **k):
+            self.started.append(StackSetName)
+            return {"OperationId": f"op-{StackSetName}"}
+
+        def describe_stack_set_operation(self, **k):
+            return {"StackSetOperation": {"Status": "RUNNING"}}
+
+        def list_stack_instances(self, **k):
+            return {"Summaries": []}
+
+    def _run_drift(self, n_stacksets, budget):
+        names = [f"AWSControlTowerBP-SS{i}" for i in range(1, n_stacksets + 1)]
+        cfn = self._DriftCfn(names)
+        orgs = FakeClient({"list_accounts": {"Accounts": [{"Id": "111111111111", "Status": "ACTIVE"}]}})
+        ctx = make_ctx({"cloudformation": cfn, "organizations": orgs})
+        ctx.detect_drift = True
+        ctx.drift_timeout = budget
+        rpt = ct.Report()
+        ct.check_stackset_active_drift(ctx, rpt)
+        return cfn, rpt
+
+    def test_exhausted_drift_budget_starts_no_further_operations(self):
+        # Reported by an SME with real timestamps: once the shared budget expired the loop
+        # kept calling DetectStackSetDrift on every remaining StackSet, firing real
+        # operations it then abandoned, and reporting each as a timeout it never had a
+        # chance to beat. Three were still running after the tool had exited.
+        cfn, _ = self._run_drift(n_stacksets=11, budget=1)
+        self.assertEqual(len(cfn.started), 1,
+                         f"started {len(cfn.started)} operations after the budget expired")
+
+    def test_unreached_stacksets_are_not_reported_as_timeouts(self):
+        _, rpt = self._run_drift(n_stacksets=11, budget=1)
+        unknown = [f for f in rpt.findings if f.level == ct.UNKNOWN]
+        self.assertTrue(unknown)
+        reasons = [r[1] for r in unknown[0].rows]
+        self.assertEqual(reasons.count("timeout"), 1, "only the started one can time out")
+        self.assertEqual(reasons.count("not_started"), 10)
+
+    def test_drift_budget_finding_discloses_operations_left_running(self):
+        # The tool exits while operations are still in flight; saying nothing about that is
+        # how a user ends up starting an upgrade against a busy StackSet.
+        _, rpt = self._run_drift(n_stacksets=3, budget=1)
+        unknown = [f for f in rpt.findings if f.level == ct.UNKNOWN][0]
+        self.assertIn("Still running when this check gave up", unknown.detail)
+        self.assertIn("shared across all StackSets", unknown.detail)
+
+    def test_drift_budget_is_not_overshot_by_a_poll_interval(self):
+        import time as _t
+        t0 = _t.time()
+        self._run_drift(n_stacksets=4, budget=1)
+        # Without the sleep cap each StackSet overshoots by a full 10s interval.
+        self.assertLess(_t.time() - t0, 8.0)
+
     def test_active_drift_skipped_when_disabled(self):
         ctx = make_ctx()  # detect_drift defaults False
         lv = levels(_run(ct.check_stackset_active_drift, ctx))
         self.assertIn(ct.INFO, lv)
         self.assertNotIn(ct.BLOCKER, lv)
 
-    def test_active_drift_detects_drift_blocks(self):
+    def test_active_drift_detects_drift_warns_not_blocks(self):
         cfn = FakeClient({
             "list_stack_sets": {"Summaries": [{"StackSetName": "AWSControlTowerExecutionRole"}]},
             "detect_stack_set_drift": {"OperationId": "op-1"},
@@ -487,7 +564,8 @@ class TestBlockerPaths(unittest.TestCase):
         ctx = make_ctx({"cloudformation": cfn, "organizations": orgs})  # 111... is mgmt (shared)
         ctx.detect_drift = True
         lv = levels(_run(ct.check_stackset_active_drift, ctx))
-        self.assertIn(ct.BLOCKER, lv)
+        self.assertIn(ct.WARNING, lv)
+        self.assertNotIn(ct.BLOCKER, lv)
 
     def test_active_drift_member_warns_not_blocks(self):
         cfn = FakeClient({
@@ -543,7 +621,7 @@ class TestBlockerPaths(unittest.TestCase):
         ctx.detect_drift = True
         ctx.assume = lambda a, r, s: member
         rpt = _run(ct.check_stackset_active_drift, ctx)
-        blk = [f for f in rpt.findings if f.level == ct.BLOCKER][0]
+        blk = [f for f in rpt.findings if f.level == ct.WARNING][0]
         self.assertIn("AWS::IAM::Role/AWSControlTowerExecutionRole:MODIFIED", blk.rows[0][-1])
 
     def test_active_drift_role_missing_points_to_stack(self):
@@ -562,8 +640,8 @@ class TestBlockerPaths(unittest.TestCase):
             raise RuntimeError("no such role")
         ctx.assume = _boom
         rpt = _run(ct.check_stackset_active_drift, ctx)
-        self.assertIn(ct.BLOCKER, levels(rpt))
-        blk = [f for f in rpt.findings if f.level == ct.BLOCKER][0]
+        self.assertIn(ct.WARNING, levels(rpt))
+        blk = [f for f in rpt.findings if f.level == ct.WARNING][0]
         self.assertIn("inspect stack", blk.rows[0][-1])
 
     def test_stacksets_drift_deduped_when_detect_drift(self):

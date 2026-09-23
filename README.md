@@ -83,7 +83,7 @@ Each check maps to a documented cause of landing-zone update failure or drift.
 | 5 | Orphaned provisioned products | Suspended account still holding an Account Factory product (→ `AWSControlTowerExecution` can't be assumed) | `organizations:ListAccounts` + `servicecatalog:SearchProvisionedProducts` | BLOCKER |
 | 6 | Enabled controls drift | Drifted / non-`SUCCEEDED` controls across every registered OU. WARNING, not a blocker: control drift is a [repairable change](https://docs.aws.amazon.com/controltower/latest/userguide/drift.html), absent from the documented list of drift to resolve right away, and resolved with `ResetEnabledControl` or by re-registering the OU | `organizations` (OU discovery) + `controltower:ListEnabledControls` | WARNING |
 | 7 | Enabled baselines drift | Drifted / non-`SUCCEEDED` baselines. Severity depends on the target: a service-integration account (management / Audit / Log archive) is a BLOCKER because a landing-zone update acts on it; a member account or OU is a WARNING, because [enrolled accounts are updated separately](https://docs.aws.amazon.com/controltower/latest/userguide/update-existing-accounts.html) and that is repairable drift. `Not Applicable` / `Not Enabled` are [expected in 4.0](https://docs.aws.amazon.com/controltower/latest/userguide/key-changes-lz-v4.html) and never reported | `controltower:ListEnabledBaselines` (`includeChildren=true`) | BLOCKER / WARNING |
-| 8 | StackSet health | `AWSControlTower*` stack instances INOPERABLE/FAILED/DRIFTED. Only **shared-account** (mgmt/audit/log-archive) instances block; **member-account** instances are WARNING; instances for **departed accounts** are INFO. OUTDATED is INFO (normal before an update). | `cloudformation:ListStackSets` / `ListStackInstances` | BLOCKER / WARNING / INFO |
+| 8 | StackSet health | `AWSControlTower*` stack instances INOPERABLE/FAILED. Only **shared-account** (mgmt/audit/log-archive) instances block; **member-account** instances are WARNING; instances for **departed accounts** are INFO. OUTDATED is INFO (normal before an update). Failures on `AWSControlTowerExecutionRole` never block in any account: the role is usually created with the account by AWS Organizations, so a failed instance is expected and does not show the role is missing — use `--check-member-roles` to test that properly. **DRIFTED** is reported separately as a WARNING, because [drift is resolved as part of the update](https://docs.aws.amazon.com/controltower/latest/userguide/resolve-drift.html) on 3.1+ and StackSet resource drift is not one of [drift.html](https://docs.aws.amazon.com/controltower/latest/userguide/drift.html)'s resolve-right-away types | `cloudformation:ListStackSets` / `ListStackInstances` | BLOCKER / WARNING / INFO |
 | 9 | AWS Config in shared accounts | Config recorders **or delivery channels** in Audit & Log Archive (across governed Regions) that Control Tower did not create — identified by name (`aws-controltower-*`), so a **single** pre-existing customer recorder in a newly governed Region is caught | `sts:AssumeRole` + `config:DescribeConfigurationRecorders` / `DescribeDeliveryChannels` | WARNING |
 | 10 | Customizations | CfCT / AFT / custom StackSets targeting governed Regions | `cloudformation` / `organizations` | INFO |
 | 11 | Trusted access | Required Organizations trusted service access disabled | `organizations:ListAWSServiceAccessForOrganization` | BLOCKER |
@@ -106,7 +106,7 @@ Each check maps to a documented cause of landing-zone update failure or drift.
 
 | Flag | Check | Detects | Data source | Default severity |
 |------|-------|---------|-------------|------------------|
-| `--detect-drift` | Active StackSet drift | Actually runs CloudFormation drift detection on `AWSControlTower*` StackSets and reports **DRIFTED** instances with the drifted resource(s); without it, stored `DriftStatus` is only as fresh as the last run (often `NOT_CHECKED`) | `cloudformation:DetectStackSetDrift` / `DescribeStackSetOperation` / `DescribeStackResourceDrifts` | BLOCKER (shared) / WARNING (member) |
+| `--detect-drift` | Active StackSet drift | Actually runs CloudFormation drift detection on `AWSControlTower*` StackSets and reports **DRIFTED** instances with the drifted resource(s); without it, stored `DriftStatus` is only as fresh as the last run (often `NOT_CHECKED`). `--drift-timeout` (default 900s) is one budget **shared across all StackSets**, not a per-StackSet allowance: when it runs out no further detections are started, and the StackSets not reached are reported as `not_started` rather than as timeouts. Detections already running are left to finish on their own and are named in the finding | `cloudformation:DetectStackSetDrift` / `DescribeStackSetOperation` / `DescribeStackResourceDrifts` | WARNING |
 | `--check-member-roles` | Member execution-role sweep | Assumes into every enrolled account to confirm `AWSControlTowerExecution` exists/assumable (missing = role drift → LZ can become unavailable) | `sts:AssumeRole` per account | WARNING |
 | `--check-kms-policy` | KMS key-policy | Landing-zone CMK key policy does not grant CT's `config`/`cloudtrail` service principals (heuristic) | `kms:GetKeyPolicy` | WARNING |
 | `--check-orphaned-resources` | Recreate-collision scan | **When the LZ looks broken** (FAILED or a foundational StackSet missing), scans the shared accounts for baseline-created resources that still exist even though the StackSet that manages them is gone (IAM roles, Config recorder/delivery channel, SNS topics, CloudWatch log groups, `NotificationForwarder` Lambda, `ConfigComplianceChangeEventRule`, `BaselineCloudTrail`, `aws-controltower-*` S3 buckets) — these collide (`already exists`) when Repair/Reset recreates them | `sts:AssumeRole` + (in shared accounts) `iam:GetRole`, `config:DescribeConfigurationRecorders`/`DescribeDeliveryChannels`, `sns:ListTopics`, `logs:DescribeLogGroups`, `lambda:GetFunction`, `events:ListRules`, `cloudtrail:DescribeTrails`, `s3:ListAllMyBuckets` | WARNING |
@@ -116,7 +116,9 @@ Each check maps to a documented cause of landing-zone update failure or drift.
 > account is a **WARNING**, because a landing-zone update/repair/reset acts on the shared accounts
 > and org config first — member accounts are re-baselined separately (via *Re-register OU*). With
 > `--detect-drift`, active drift detection owns `DRIFTED` reporting and the stored-status check
-> defers to it (no double-counting).
+> defers to it (no double-counting). Drift itself is a **WARNING** wherever it is found: it is
+> repairable, and an update resolves it — which is also why it is worth reviewing first, since the
+> update resolves drift by reasserting Control Tower's intent over your out-of-band change.
 
 The core CT management-account IAM roles verified by check #13 are required on **every** landing
 zone version: `AWSControlTowerAdmin`, `AWSControlTowerCloudTrailRole`, and
@@ -335,7 +337,7 @@ RESULT: NOT SAFE TO UPGRADE — 2 blocker(s), 0 warning(s), 0 unverified.
 
 The blocker-detection logic is proven offline with a mocked-response harness — no AWS account
 or network needed. It feeds each check simulated good/bad API responses and asserts the correct
-severity fires (e.g. DRIFTED → BLOCKER, OUTDATED StackSet → INFO, unreachable shared account →
+severity fires (e.g. INOPERABLE in a shared account → BLOCKER, DRIFTED → WARNING, OUTDATED StackSet → INFO, unreachable shared account →
 UNKNOWN not PASS, a Deny SCP without an `AWSControlTowerExecution` exemption → WARNING).
 
 ```bash

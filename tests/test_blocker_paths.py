@@ -292,6 +292,151 @@ class TestBlockerPaths(unittest.TestCase):
         self.assertIn(ct.UNKNOWN, lv)
         self.assertNotIn(ct.PASS, lv)
 
+    # 7c. Foundational OU structure — three of drift.html's four urgent drift types --------
+    ALL_ON = {"centralizedLogging": {"enabled": True, "accountId": "555555555555"},
+              "securityRoles": {"enabled": True, "accountId": "444444444444"},
+              "config": {"enabled": True, "accountId": "444444444444"},
+              "backup": {"enabled": True, "configurations": {
+                  "backupAdmin": {"accountId": "777777777777"},
+                  "centralBackup": {"accountId": "888888888888"}}}}
+
+    def _ou_ctx(self, parents, ou_accounts, ous, manifest=None):
+        """parents: accountId -> parentId. ou_accounts: parentId -> [account dicts]."""
+        orgs = FakeClient({
+            "list_accounts": {"Accounts": [{"Id": a, "Status": "ACTIVE"} for a in parents]},
+            "list_parents": lambda ChildId=None, **k: {
+                "Parents": [{"Id": parents[ChildId], "Type": "ORGANIZATIONAL_UNIT"}]}
+                if ChildId in parents else {"Parents": []},
+            "list_accounts_for_parent": lambda ParentId=None, **k: {
+                "Accounts": ou_accounts.get(ParentId, [])},
+        })
+        ctx = make_ctx({"organizations": orgs},
+                       manifest=manifest if manifest is not None else self.ALL_ON)
+        ctx.all_ou_arns = lambda: ous
+        return ctx
+
+    def test_foreign_account_in_foundational_ou_blocks(self):
+        # Control Tower's update validator rejects this outright: "the Security OU contains
+        # accounts other than the shared accounts ... then try again."
+        ctx = self._ou_ctx(
+            parents={"444444444444": "ou-sec", "555555555555": "ou-sec",
+                     "777777777777": "ou-sec", "888888888888": "ou-sec"},
+            ou_accounts={"ou-sec": [{"Id": "444444444444"}, {"Id": "555555555555"},
+                                    {"Id": "777777777777"}, {"Id": "888888888888"},
+                                    {"Id": "333333333333", "Name": "workload"}]},
+            ous=[{"Id": "ou-sec", "Arn": "arn:ou-sec", "Name": "Security"},
+                 {"Id": "ou-wl", "Arn": "arn:ou-wl", "Name": "Workloads"}])
+        lv = levels(_run(ct.check_foundational_ou_structure, ctx))
+        self.assertIn(ct.BLOCKER, lv)
+
+    def test_disabled_integration_does_not_make_its_account_look_foreign(self):
+        # Found live: a landing zone with centralizedLogging disabled names no logging account,
+        # but the Log Archive account still sits in the Foundational OU. Judging against that
+        # incomplete list reported a legitimate shared account as foreign - a false blocker on a
+        # landing zone that had just upgraded successfully.
+        manifest = {"centralizedLogging": {"enabled": False},
+                    "securityRoles": {"enabled": True, "accountId": "444444444444"},
+                    "config": {"enabled": True, "accountId": "444444444444"}}
+        ctx = self._ou_ctx(
+            parents={"444444444444": "ou-sec"},
+            ou_accounts={"ou-sec": [{"Id": "444444444444"},
+                                    {"Id": "555555555555", "Name": "Log Account"}]},
+            ous=[{"Id": "ou-sec", "Arn": "arn:ou-sec", "Name": "Security"},
+                 {"Id": "ou-wl", "Arn": "arn:ou-wl", "Name": "Workloads"}],
+            manifest=manifest)
+        lv = levels(_run(ct.check_foundational_ou_structure, ctx))
+        self.assertNotIn(ct.BLOCKER, lv)
+        self.assertIn(ct.INFO, lv, "the skipped comparison must be disclosed, not silent")
+
+    def test_absent_enabled_flag_is_not_treated_as_disabled(self):
+        # Pre-4.0 manifests omit the `enabled` flag entirely. Reading absent as disabled would
+        # skip the comparison on every older landing zone.
+        manifest = {"securityRoles": {"accountId": "444444444444"},
+                    "centralizedLogging": {"accountId": "555555555555"}}
+        ctx = self._ou_ctx(
+            parents={"444444444444": "ou-sec", "555555555555": "ou-sec"},
+            ou_accounts={"ou-sec": [{"Id": "444444444444"}, {"Id": "555555555555"},
+                                    {"Id": "333333333333", "Name": "workload"}]},
+            ous=[{"Id": "ou-sec", "Arn": "arn:ou-sec", "Name": "Security"},
+                 {"Id": "ou-wl", "Arn": "arn:ou-wl", "Name": "Workloads"}],
+            manifest=manifest)
+        # The comparison must actually run, so the foreign account is found.
+        self.assertIn(ct.BLOCKER, levels(_run(ct.check_foundational_ou_structure, ctx)))
+
+    def test_shared_accounts_split_across_ous_warns(self):
+        # drift.html: "Don't remove shared accounts ... To remediate this type of drift, you
+        # must update the landing zone." The update is the remedy, so this warns, not blocks.
+        ctx = self._ou_ctx(
+            parents={"444444444444": "ou-sec", "555555555555": "ou-other",
+                     "777777777777": "ou-sec", "888888888888": "ou-sec"},
+            ou_accounts={},
+            ous=[{"Id": "ou-sec", "Arn": "arn:ou-sec", "Name": "Security"},
+                 {"Id": "ou-other", "Arn": "arn:ou-other", "Name": "Other"}])
+        lv = levels(_run(ct.check_foundational_ou_structure, ctx))
+        self.assertIn(ct.WARNING, lv)
+        self.assertNotIn(ct.BLOCKER, lv)
+
+    def test_no_additional_ou_warns(self):
+        # drift.html: "At least one Additional OU is required for AWS Control Tower to operate."
+        ctx = self._ou_ctx(
+            parents={"444444444444": "ou-sec", "555555555555": "ou-sec",
+                     "777777777777": "ou-sec", "888888888888": "ou-sec"},
+            ou_accounts={"ou-sec": [{"Id": "444444444444"}, {"Id": "555555555555"},
+                                    {"Id": "777777777777"}, {"Id": "888888888888"}]},
+            ous=[{"Id": "ou-sec", "Arn": "arn:ou-sec", "Name": "Security"}])
+        rpt = _run(ct.check_foundational_ou_structure, ctx)
+        warn = [f for f in rpt.findings if f.level == ct.WARNING]
+        self.assertTrue(warn and "Additional OU" in warn[0].summary)
+
+    def test_healthy_foundational_ou_passes(self):
+        ctx = self._ou_ctx(
+            parents={"444444444444": "ou-sec", "555555555555": "ou-sec",
+                     "777777777777": "ou-sec", "888888888888": "ou-sec"},
+            ou_accounts={"ou-sec": [{"Id": "444444444444"}, {"Id": "555555555555"},
+                                    {"Id": "777777777777"}, {"Id": "888888888888"}]},
+            ous=[{"Id": "ou-sec", "Arn": "arn:ou-sec", "Name": "Security"},
+                 {"Id": "ou-wl", "Arn": "arn:ou-wl", "Name": "Workloads"}])
+        lv = levels(_run(ct.check_foundational_ou_structure, ctx))
+        self.assertIn(ct.PASS, lv)
+        self.assertNotIn(ct.BLOCKER, lv)
+        self.assertNotIn(ct.WARNING, lv)
+
+    def test_unreadable_parent_is_unknown_not_pass(self):
+        orgs = FakeClient(
+            responses={"list_accounts": {"Accounts": []}},
+            errors={"list_parents": client_error("AccessDeniedException", "ListParents")})
+        ctx = make_ctx({"organizations": orgs}, manifest=self.ALL_ON)
+        ctx.all_ou_arns = lambda: [{"Id": "ou-sec", "Arn": "a", "Name": "Security"}]
+        lv = levels(_run(ct.check_foundational_ou_structure, ctx))
+        self.assertIn(ct.UNKNOWN, lv)
+        self.assertNotIn(ct.PASS, lv)
+
+    # 7d. Governed Region availability ---------------------------------------------------
+    def test_disabled_governed_region_warns(self):
+        acct = FakeClient({"list_regions": {"Regions": [
+            {"RegionName": "us-east-1", "RegionOptStatus": "ENABLED_BY_DEFAULT"},
+            {"RegionName": "me-central-1", "RegionOptStatus": "DISABLED"}]}})
+        ctx = make_ctx({"account": acct}, governed_regions=["us-east-1", "me-central-1"])
+        rpt = _run(ct.check_governed_region_availability, ctx)
+        self.assertIn(ct.WARNING, levels(rpt))
+        warn = [f for f in rpt.findings if f.level == ct.WARNING][0]
+        self.assertEqual(warn.rows[0][0], "me-central-1")
+
+    def test_all_governed_regions_enabled_passes(self):
+        acct = FakeClient({"list_regions": {"Regions": [
+            {"RegionName": "us-east-1", "RegionOptStatus": "ENABLED_BY_DEFAULT"},
+            {"RegionName": "eu-west-2", "RegionOptStatus": "ENABLED"}]}})
+        ctx = make_ctx({"account": acct}, governed_regions=["us-east-1", "eu-west-2"])
+        self.assertIn(ct.PASS, levels(_run(ct.check_governed_region_availability, ctx)))
+
+    def test_governed_region_read_failure_is_unknown(self):
+        acct = FakeClient(errors={"list_regions":
+                                  client_error("AccessDeniedException", "ListRegions")})
+        ctx = make_ctx({"account": acct}, governed_regions=["us-east-1"])
+        lv = levels(_run(ct.check_governed_region_availability, ctx))
+        self.assertIn(ct.UNKNOWN, lv)
+        self.assertNotIn(ct.PASS, lv)
+
     # 8. StackSets: INOPERABLE blocks; OUTDATED is INFO ----------------------------
     def test_stacksets_inoperable_in_shared_blocks(self):
         cfn = FakeClient({

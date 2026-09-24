@@ -82,8 +82,9 @@ EXIT CODES
 
 REQUIRED PERMISSIONS (management account, read-only)
     controltower:ListLandingZones, GetLandingZone, ListEnabledControls, ListEnabledBaselines
+    account:ListRegions (governed-Region opt-in status)
     organizations:ListRoots, ListOrganizationalUnitsForParent,
-                  ListAccounts, ListPoliciesForTarget, ListParents,
+                  ListAccounts, ListAccountsForParent, ListPoliciesForTarget, ListParents,
                   ListAWSServiceAccessForOrganization, ListDelegatedAdministrators,
                   ListDelegatedServicesForAccount, DescribePolicy
     servicecatalog:SearchProvisionedProducts
@@ -174,6 +175,11 @@ _CHECK_DOCS = {
     "controls_drift": f"{DOC}/resolving-drift.html",
     "baselines_drift": f"{DOC}/resolve-drift.html",
     "stale_baseline_targets": f"{DOC}/troubleshooting.html",
+    "foundational_ou": f"{DOC}/drift.html",
+    "foundational_ou_placement": f"{DOC}/drift.html",
+    "foundational_ou_extra_accounts": f"{DOC}/drift.html",
+    "foundational_ou_additional": f"{DOC}/drift.html",
+    "governed_regions": f"{DOC}/region-how.html",
     "stacksets": f"{DOC}/drift.html",
     "stacksets_member": f"{DOC}/drift.html",
     "stacksets_expected": f"{DOC}/drift.html",
@@ -2206,6 +2212,219 @@ def check_scp_blocking(ctx: Context, report: Report) -> None:
                            f"found across {checked} target(s){_scope_suffix(skipped)}"))
 
 
+def check_foundational_ou_structure(ctx: Context, report: Report) -> None:
+    """Three of the four drift types drift.html says to resolve right away, all of which are
+    management/shared-account scope and readable from data already fetched.
+
+    drift.html, "Types of drift to resolve right away":
+      - "Don't delete the Security OU ... you'll see an error message instructing you to
+        reset the landing zone immediately. You won't be able to take any other actions in
+        AWS Control Tower until the reset is complete."
+      - "Don't delete all Additional OUs: At least one Additional OU is required for AWS
+        Control Tower to operate, but it doesn't have to be the Sandbox OU."
+      - "Don't remove shared accounts: If you remove shared accounts from Foundational OUs
+        ... To remediate this type of drift, you must update the landing zone."
+
+    Separately, Control Tower's own update validator rejects extra accounts in the Security
+    OU outright: "AWS Control Tower could not complete your setup because the Security OU
+    contains accounts other than the shared accounts. Remove these accounts from the
+    Security OU, then try again." That is a hard block, so it is graded BLOCKER; the two
+    drift conditions above are WARNING, since the documented remediation for a moved shared
+    account is itself a landing-zone update.
+
+    The Foundational OU is identified by WHERE the shared accounts live, never by name.
+    Renaming the Security OU is explicitly permitted ("Change the name of the Security OU"),
+    and on 4.0 the OU holding the service-integration accounts becomes the Security OU.
+    """
+    shared = {a for a in ctx.shared_accounts if a and a != ctx.mgmt_account}
+    if not shared:
+        report.add(Finding("foundational_ou", UNKNOWN,
+                           "No shared accounts discovered, so OU structure cannot be checked",
+                           "The Audit and Log Archive account ids come from the landing-zone "
+                           "manifest. Without them the Foundational OU cannot be identified.",
+                           remediation="Pass --audit-account / --log-archive-account, or check "
+                                       "that the manifest declares the service integrations."))
+        return
+    try:
+        all_accounts = _collect(ctx.orgs, "list_accounts", "Accounts")
+        ous = ctx.all_ou_arns()
+    except (ClientError, BotoCoreError) as e:
+        report.add(Finding("foundational_ou", UNKNOWN,
+                           "Could not read the organization's OUs and accounts", str(e)))
+        return
+
+    # Where does each shared account sit?
+    parents: Dict[str, str] = {}
+    unresolved: List[List[str]] = []
+    for acct in sorted(shared):
+        try:
+            p = _collect(ctx.orgs, "list_parents", "Parents", ChildId=acct)
+        except (ClientError, BotoCoreError) as e:
+            unresolved.append([acct, _error_code(e) or "error", _skip_note(e)])
+            continue
+        if not p:
+            unresolved.append([acct, "no parent returned", ""])
+            continue
+        parents[acct] = p[0].get("Id", "")
+    if unresolved:
+        report.add(Finding("foundational_ou", UNKNOWN,
+                           f"Could not locate {len(unresolved)} shared account(s) in the OU tree",
+                           "The Foundational OU checks could not be fully evaluated. Treat this "
+                           "as not checked rather than as a pass.",
+                           cols=["Account", "Error", "Detail"], rows=unresolved,
+                           remediation="Grant organizations:ListParents and re-run."))
+    if not parents:
+        return
+
+    ou_names = {o["Id"]: o["Name"] for o in ous}
+    distinct = sorted(set(parents.values()))
+
+    # 1. Shared accounts must sit together in a Foundational OU, not split and not at root.
+    at_root = [a for a, p in parents.items() if p not in ou_names]
+    if len(distinct) > 1 or at_root:
+        rows = [[a, p, ou_names.get(p, "(root - not an OU)")] for a, p in sorted(parents.items())]
+        report.add(Finding("foundational_ou_placement", WARNING,
+                           "Shared accounts are not together in one Foundational OU",
+                           "drift.html: \"Don't remove shared accounts: If you remove shared "
+                           "accounts from Foundational OUs with the AWS Organizations console or "
+                           "APIs, such as removing the logging account from the Security OU. "
+                           "Moving these accounts creates a type of Move Account drift that must "
+                           "be remediated. To remediate this type of drift, you must update the "
+                           "landing zone.\" A landing-zone update is the documented remediation, "
+                           "so this does not block the update - but the resulting layout is "
+                           "unsupported and worth confirming was intentional before you start.",
+                           cols=["Shared account", "Parent id", "Parent name"], rows=rows,
+                           remediation="Move the shared accounts back under a single Foundational "
+                                       f"OU. See {DOC}/drift.html"))
+        return  # the checks below assume one identifiable Foundational OU
+
+    foundational = distinct[0]
+    f_name = ou_names.get(foundational, foundational)
+
+    # 2. That OU should contain ONLY the shared accounts. Control Tower's update validator
+    #    rejects anything else outright.
+    #
+    #    But this can only be judged when the manifest names EVERY shared account. A disabled
+    #    service integration names no account while its account usually still exists and still
+    #    sits in the Foundational OU - a landing zone with centralizedLogging disabled keeps
+    #    its Log Archive account there. Judging against an incomplete set would report that
+    #    account as foreign, which is a false blocker on a healthy landing zone. So when any
+    #    integration is explicitly disabled, this particular test is skipped and said to be
+    #    skipped, rather than guessed at.
+    # An absent `enabled` flag is NOT "disabled" - pre-4.0 manifests omit it entirely - so only
+    # an explicit False counts. Keys are deduplicated because Backup contributes two entries.
+    disabled = []
+    for key, label, _ in _SERVICE_INTEGRATION_ACCOUNTS:
+        if _integration_enabled(ctx, key) is False and key not in [d[0] for d in disabled]:
+            disabled.append((key, label.split(" (")[0]))
+    disabled_labels = [d[1] for d in disabled]
+    extra: List[List[str]] = []
+    in_ou = None
+    if disabled:
+        report.add(Finding("foundational_ou_extra_accounts", INFO,
+                           "Not checked whether the Foundational OU holds only shared accounts",
+                           "Control Tower rejects a landing-zone update when the Security OU "
+                           "contains accounts other than the shared accounts. Deciding that needs "
+                           "the full list of shared accounts, and this manifest has "
+                           f"{len(disabled)} service integration(s) disabled ("
+                           + ", ".join(disabled_labels) + "), which name no account. A disabled "
+                           "integration's account commonly still exists and still sits in the "
+                           "Foundational OU - disabling an integration does not move or remove it "
+                           "- so comparing against an incomplete list would report a legitimate "
+                           "shared account as foreign.",
+                           remediation="Pass --audit-account / --log-archive-account to name the "
+                                       "shared accounts explicitly, then re-run to have this "
+                                       "checked."))
+    else:
+        try:
+            in_ou = _collect(ctx.orgs, "list_accounts_for_parent", "Accounts",
+                             ParentId=foundational)
+        except (ClientError, BotoCoreError) as e:
+            report.add(Finding("foundational_ou", UNKNOWN,
+                               f"Could not list the accounts in the Foundational OU ({f_name})",
+                               str(e),
+                               remediation="Grant organizations:ListAccountsForParent and re-run."))
+        if in_ou is not None:
+            extra = [[a.get("Id", ""), a.get("Name", ""), a.get("Status", "")]
+                     for a in in_ou if a.get("Id") not in shared]
+            if extra:
+                report.add(Finding("foundational_ou_extra_accounts", BLOCKER,
+                                   f"{len(extra)} account(s) in the Foundational OU ({f_name}) are "
+                                   "not shared accounts",
+                                   "Control Tower validates this during a landing-zone update and "
+                                   "rejects it: \"AWS Control Tower could not complete your setup "
+                                   "because the Security OU contains accounts other than the "
+                                   "shared accounts. Remove these accounts from the Security OU, "
+                                   "then try again.\" Every service integration in this manifest "
+                                   "is enabled, so the shared-account list is complete and these "
+                                   "accounts are genuinely foreign to the Foundational OU.",
+                                   cols=["Account", "Name", "Status"], rows=extra,
+                                   remediation="Move these accounts to a registered OU outside the "
+                                               "Foundational OU before upgrading."))
+
+    # 3. At least one OU must exist besides the Foundational one.
+    additional = [o for o in ous if o["Id"] != foundational]
+    if not additional:
+        report.add(Finding("foundational_ou_additional", WARNING,
+                           "No Additional OU exists besides the Foundational OU",
+                           "drift.html: \"Don't delete all Additional OUs: At least one "
+                           "Additional OU is required for AWS Control Tower to operate, but it "
+                           "doesn't have to be the Sandbox OU.\" With only the Foundational OU "
+                           "present, Control Tower has nowhere to place enrolled accounts.",
+                           remediation="Create and register at least one Additional OU."))
+
+    if not extra and additional:
+        scope = "" if in_ou is not None else " (shared-account contents not compared - see above)"
+        report.add(Finding("foundational_ou", PASS,
+                           f"Shared accounts are together in one Foundational OU ({f_name}) and "
+                           f"{len(additional)} other OU(s) exist{scope}"))
+
+
+def check_governed_region_availability(ctx: Context, report: Report) -> None:
+    """Every governed Region must be usable by this account.
+
+    A governed Region that is not enabled in the management account has been observed
+    blocking a landing-zone update. Reported as WARNING rather than BLOCKER because opt-in
+    status is only one of the reasons a Region can be unusable: a service-side regional
+    event can block an update while every Region still reports as enabled here, and that is
+    not detectable from the account. So a finding here is a real problem, but a clean result
+    is not proof the Regions are healthy.
+    """
+    if not ctx.governed_regions:
+        report.add(Finding("governed_regions", UNKNOWN,
+                           "No governed Regions found in the landing-zone manifest",
+                           "Region availability could not be evaluated."))
+        return
+    try:
+        acct = ctx.session.client("account", region_name=ctx.region)
+        regions = {r["RegionName"]: r.get("RegionOptStatus", "")
+                   for r in _collect(acct, "list_regions", "Regions")}
+    except (ClientError, BotoCoreError) as e:
+        report.add(Finding("governed_regions", UNKNOWN,
+                           "Could not read Region opt-in status", str(e),
+                           remediation="Grant account:ListRegions and re-run."))
+        return
+    usable = ("ENABLED", "ENABLED_BY_DEFAULT")
+    bad = [[r, regions.get(r) or "not returned by ListRegions"]
+           for r in ctx.governed_regions if regions.get(r) not in usable]
+    if bad:
+        report.add(Finding("governed_regions", WARNING,
+                           f"{len(bad)} governed Region(s) are not enabled for this account",
+                           "The landing zone governs these Regions, but they are not enabled in "
+                           "the management account. A Region that Control Tower cannot operate "
+                           "in has been observed failing a landing-zone update. Note the inverse "
+                           "does not hold: a Region can be enabled here and still be unusable "
+                           "because of a service-side regional event, which this check cannot "
+                           "see.",
+                           cols=["Governed Region", "Opt-in status"], rows=bad,
+                           remediation="Enable the Region for the organization, or remove it from "
+                                       "the landing zone's governed Regions before upgrading."))
+    else:
+        report.add(Finding("governed_regions", PASS,
+                           f"All {len(ctx.governed_regions)} governed Region(s) are enabled for "
+                           "this account"))
+
+
 def check_stackset_operations_in_progress(ctx: Context, report: Report) -> None:
     """A landing-zone update cannot run concurrently with an in-progress StackSet operation
     on the CT-managed StackSets — it conflicts and fails. Flag RUNNING/STOPPING operations."""
@@ -2849,6 +3068,8 @@ CHECKS = [
     check_enabled_controls,
     check_enabled_baselines,
     check_stale_baseline_targets,
+    check_foundational_ou_structure,
+    check_governed_region_availability,
     check_stacksets,
     check_expected_stacksets,
     check_stackset_active_drift,

@@ -103,7 +103,7 @@ import json
 import os
 import sys
 from dataclasses import dataclass, field, asdict
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 try:
     import boto3
@@ -2027,13 +2027,68 @@ def check_scp_headroom(ctx: Context, report: Report) -> None:
                            cols=["Target", "SCP Name", "SCP Id"], rows=custom_rows))
 
 
+# The AWS services Control Tower actually acts on inside MEMBER accounts during a
+# landing-zone update, and therefore the only services a Deny can interfere with.
+#
+# This is not a guess: it is the set of service prefixes Control Tower's own
+# aws-guardrails-* SCPs deny while carrying an AWSControlTowerExecution exemption. Control
+# Tower exempts itself for exactly the actions it must perform, so its guardrails are a
+# statement of what it needs. Counted across live organizations: config, lambda, iam, sns,
+# events, s3, cloudtrail, logs, cloudformation. "controltower" appears in none of them.
+#
+# Why that matters: the controltower:* APIs are org-level control-plane calls
+# (UpdateLandingZone, EnableControl, ListEnabledBaselines) issued from the MANAGEMENT
+# account, where SCPs never apply - "SCPs affect only member accounts in the organization.
+# They have no effect on users or roles in the management account."
+# (organizations/latest/userguide/orgs_manage_policies_scps.html). Control Tower never calls
+# them from inside a member account, so a Deny on controltower:* cannot affect an update.
+# Verified: a 3.3 -> 4.0 landing-zone upgrade completed successfully with
+# `Deny controltower:* on *` attached to the organization root throughout, with zero
+# access-denied events - confirmed enforced on the Security OU's accounts at the time.
+_CT_MEMBER_ACCOUNT_SERVICES = frozenset((
+    "cloudformation", "cloudtrail", "config", "events", "iam",
+    "lambda", "logs", "s3", "sns",
+))
+
+
+def _denied_action_services(stmt: dict) -> Optional[Set[str]]:
+    """Service prefixes a Deny statement restricts.
+
+    Returns None when the statement cannot be reduced to a service set and must therefore
+    be treated as risky regardless: a NotAction deny is inverted (it denies everything
+    EXCEPT what it lists), and an Action of "*" denies everything. Both occur in practice.
+    """
+    if "NotAction" in stmt:
+        return None
+    actions = stmt.get("Action")
+    if actions is None:
+        return None
+    if isinstance(actions, str):
+        actions = [actions]
+    services = set()
+    for a in actions:
+        a = str(a)
+        if a.strip() == "*":
+            return None
+        if ":" in a:
+            services.add(a.split(":", 1)[0].lower())
+    return services
+
+
 def check_scp_blocking(ctx: Context, report: Report) -> None:
     """SCP *content* can block a Control Tower update, per AWS guidance:
       - The `FullAWSAccess` SCP must remain attached (its removal breaks CT access).
-      - A custom Deny that does not exempt the AWSControlTowerExecution role can block
-        the operations CT performs in member accounts during the update.
+      - A custom Deny on a service Control Tower acts on in member accounts, without an
+        AWSControlTowerExecution exemption, can block the work the update does there.
       - Restricting Regions via SCP (instead of the CT Region deny control) puts CT in an
         'undefined state'.
+
+    Severity depends on WHICH actions are denied, not merely on whether the statement names
+    the Control Tower role. A Deny that touches none of the services CT uses in member
+    accounts cannot interfere - most notably a Deny on controltower:* itself, since those
+    are management-account control-plane calls and SCPs never apply to the management
+    account. See _CT_MEMBER_ACCOUNT_SERVICES for the service set and the evidence behind it.
+
     This is a heuristic (it does not fully simulate policy evaluation), so risky SCPs are
     reported as WARNING for human review, not auto-BLOCKER."""
     try:
@@ -2091,8 +2146,26 @@ def check_scp_blocking(ctx: Context, report: Report) -> None:
                 blob = json.dumps(stmt)
                 exempts_ct = "AWSControlTowerExecution" in blob
                 restricts_region = "aws:RequestedRegion" in blob
+                services = _denied_action_services(stmt)
+                if services is not None and not (services & _CT_MEMBER_ACCOUNT_SERVICES):
+                    # Nothing Control Tower does in a member account is denied here, so an
+                    # AWSControlTowerExecution exemption would change nothing. Report the
+                    # Region restriction if present; otherwise this statement is not a
+                    # finding. A Deny on controltower:* lands here: those are management
+                    # account control-plane calls, and SCPs never apply there.
+                    if restricts_region:
+                        risky.append([t["Name"], name,
+                                      "Region restriction via SCP (use CT Region deny)"])
+                        break
+                    continue
                 if not exempts_ct:
-                    reason = ("Deny does not exempt AWSControlTowerExecution"
+                    if services is None:
+                        scope = ("denies all actions, or uses NotAction, so it cannot be "
+                                 "evaluated by action")
+                    else:
+                        hit = sorted(services & _CT_MEMBER_ACCOUNT_SERVICES)
+                        scope = "denies " + ", ".join(f"{s}:*" for s in hit)
+                    reason = (f"Deny does not exempt AWSControlTowerExecution and {scope}"
                               + ("; also restricts Regions" if restricts_region else ""))
                     risky.append([t["Name"], name, reason])
                     break  # one row per SCP/target is enough
@@ -2113,13 +2186,20 @@ def check_scp_blocking(ctx: Context, report: Report) -> None:
     if risky:
         report.add(Finding("scp_blocking", WARNING,
                            f"{len(risky)} custom SCP attachment(s) may block Control Tower",
-                           "These custom SCPs contain a Deny that does not exempt the "
-                           "AWSControlTowerExecution role, or restrict Regions via SCP. Either can "
-                           "cause the update to fail. Verify they exempt CT (ArnNotLike on "
-                           "aws:PrincipalARN) or move Region restriction to the CT Region deny control.",
+                           "These custom SCPs deny a service Control Tower acts on inside member "
+                           "accounts without exempting AWSControlTowerExecution, deny everything "
+                           "(Action \"*\" or NotAction) so they cannot be evaluated by action, or "
+                           "restrict Regions via SCP. Any of those can cause the update to fail. "
+                           "The Risk column names which services are denied. A Deny that touches "
+                           "none of the services CT uses in a member account is not reported, "
+                           "including a Deny on controltower:* - those are management-account "
+                           "calls, and SCPs never apply to the management account.",
                            cols=["Target", "SCP", "Risk"], rows=risky,
-                           remediation="Add an AWSControlTowerExecution exemption, or detach the SCP "
-                                       "for the upgrade. See the CT SCP guidance."))
+                           remediation="For a Deny on a service CT uses, add an "
+                                       "AWSControlTowerExecution exemption (ArnNotLike on "
+                                       "aws:PrincipalArn) or detach the SCP for the upgrade. For a "
+                                       "Region restriction, use the Control Tower Region deny "
+                                       "control instead."))
     if not missing_fullaccess and not risky:
         report.add(Finding("scp_blocking", PASS,
                            f"FullAWSAccess present and no CT-blocking custom SCP patterns "

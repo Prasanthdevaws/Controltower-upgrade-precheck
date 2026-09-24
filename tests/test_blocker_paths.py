@@ -19,6 +19,7 @@ No AWS credentials or network are used.
 """
 
 import importlib.util
+import json
 import os
 import sys
 import unittest
@@ -977,19 +978,86 @@ class TestBlockerPaths(unittest.TestCase):
         self.assertIn(ct.WARNING, levels(_run(ct.check_scp_headroom, ctx)))
 
     # 17. SCP blocking content -----------------------------------------------------
-    def test_scp_deny_without_ct_exemption_warns(self):
-        orgs = FakeClient({
+    @staticmethod
+    def _scp_orgs(content, with_fullaccess=True):
+        pols = [{"Name": "custom", "Id": "p-x", "AwsManaged": False}]
+        if with_fullaccess:
+            pols.insert(0, {"Name": "FullAWSAccess", "Id": "p-Full", "AwsManaged": True})
+        return FakeClient({
             "list_roots": {"Roots": [{"Id": "r-root"}]},
-            "list_organizational_units_for_parent": lambda ParentId=None, **k: {"OrganizationalUnits": []},
-            # customer SCP attached, and FullAWSAccess NOT present
-            "list_policies_for_target": {"Policies": [
-                {"Name": "restrict-ec2", "Id": "p-restrict", "AwsManaged": False}]},
-            "describe_policy": {"Policy": {"Content":
-                '{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":"ec2:*","Resource":"*"}]}'}},
+            "list_organizational_units_for_parent":
+                lambda ParentId=None, **k: {"OrganizationalUnits": []},
+            "list_policies_for_target": {"Policies": pols},
+            "describe_policy": lambda PolicyId=None, **k: {
+                "Policy": {"Content": content if PolicyId == "p-x" else "{}"}},
         })
-        ctx = make_ctx({"organizations": orgs})
-        # both the missing-FullAWSAccess and the risky-Deny should raise WARNING
+
+    @staticmethod
+    def _deny(action, condition=None):
+        stmt = {"Effect": "Deny", "Action": action, "Resource": "*"}
+        if condition:
+            stmt["Condition"] = condition
+        return json.dumps({"Version": "2012-10-17", "Statement": [stmt]})
+
+    def test_scp_deny_on_ct_service_without_exemption_warns(self):
+        # config is a service Control Tower acts on inside member accounts, so a Deny on it
+        # without an AWSControlTowerExecution exemption can genuinely interfere.
+        ctx = make_ctx({"organizations": self._scp_orgs(self._deny("config:*"))})
+        rpt = _run(ct.check_scp_blocking, ctx)
+        self.assertIn(ct.WARNING, levels(rpt))
+        risky = [f for f in rpt.findings if f.level == ct.WARNING][0]
+        self.assertIn("config:*", risky.rows[0][2])
+
+    def test_scp_missing_fullaccess_warns_independently(self):
+        # Separate concern from a risky Deny: FullAWSAccess must stay attached.
+        ctx = make_ctx({"organizations": self._scp_orgs(self._deny("ec2:*"),
+                                                       with_fullaccess=False)})
+        rpt = _run(ct.check_scp_blocking, ctx)
+        summaries = " ".join(f.summary for f in rpt.findings if f.level == ct.WARNING)
+        self.assertIn("FullAWSAccess", summaries)
+
+    def test_scp_deny_on_controltower_actions_is_not_reported(self):
+        # Verified on a live organization: a 3.3 -> 4.0 landing-zone upgrade succeeded with
+        # `Deny controltower:* on *` attached to the organization root throughout. The
+        # controltower:* APIs are management-account control-plane calls and SCPs never apply
+        # to the management account, so this cannot block an update. Reporting it told users
+        # to add a role exemption that would change nothing.
+        ctx = make_ctx({"organizations": self._scp_orgs(self._deny("controltower:*"))})
+        lv = levels(_run(ct.check_scp_blocking, ctx))
+        self.assertIn(ct.PASS, lv)
+        self.assertNotIn(ct.WARNING, lv)
+
+    def test_scp_deny_on_unrelated_service_is_not_reported(self):
+        ctx = make_ctx({"organizations": self._scp_orgs(self._deny("ec2:*"))})
+        lv = levels(_run(ct.check_scp_blocking, ctx))
+        self.assertIn(ct.PASS, lv)
+        self.assertNotIn(ct.WARNING, lv)
+
+    def test_scp_deny_all_actions_still_warns(self):
+        # Action "*" denies everything, including what CT needs. It cannot be dismissed by
+        # intersecting service prefixes, so it must stay a warning.
+        ctx = make_ctx({"organizations": self._scp_orgs(self._deny("*"))})
+        lv = levels(_run(ct.check_scp_blocking, ctx))
+        self.assertIn(ct.WARNING, lv)
+
+    def test_scp_notaction_deny_still_warns(self):
+        # NotAction is inverted - it denies everything EXCEPT what it lists - so the same
+        # applies. Both shapes occur on real organizations.
+        content = json.dumps({"Version": "2012-10-17", "Statement": [
+            {"Effect": "Deny", "NotAction": ["s3:GetObject"], "Resource": "*"}]})
+        ctx = make_ctx({"organizations": self._scp_orgs(content)})
         self.assertIn(ct.WARNING, levels(_run(ct.check_scp_blocking, ctx)))
+
+    def test_scp_region_restriction_reported_even_on_unrelated_actions(self):
+        # Region restriction via SCP is a separate documented problem, so it is reported even
+        # when the denied actions are ones CT never performs in a member account.
+        ctx = make_ctx({"organizations": self._scp_orgs(self._deny(
+            "controltower:*",
+            {"StringNotEquals": {"aws:RequestedRegion": ["us-east-1"]}}))})
+        rpt = _run(ct.check_scp_blocking, ctx)
+        self.assertIn(ct.WARNING, levels(rpt))
+        risky = [f for f in rpt.findings if f.level == ct.WARNING][0]
+        self.assertIn("Region restriction", risky.rows[0][2])
 
     def test_scp_deny_with_ct_exemption_and_fullaccess_passes(self):
         orgs = FakeClient({

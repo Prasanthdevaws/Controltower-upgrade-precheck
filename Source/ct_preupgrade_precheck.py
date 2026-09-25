@@ -16,10 +16,11 @@ CloudFormation drift-detection operation. It exits non-zero when a BLOCKER is fo
 also when a check could not be evaluated, so an upgrade runbook can gate on it.
 
 WHAT IT CHECKS
-    30 checks, most on by default and a few behind an opt-in flag. The authoritative
+    Most checks run by default; a few are behind an opt-in flag. The authoritative
     per-check table — what each one detects, its data source and its severity — is in
     README.md, and the executable list is CHECKS near the bottom of this file. Both track
-    the code, so prefer them to this summary.
+    the code, so prefer them to this summary. A count is deliberately not stated here: it
+    went stale three times.
 
     Landing zone state     status ACTIVE, drift IN_SYNC, whether an update is available,
                            and the version-specific changes on the path to the target

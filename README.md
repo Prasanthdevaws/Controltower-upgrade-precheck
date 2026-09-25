@@ -343,7 +343,7 @@ severity fires (e.g. INOPERABLE in a shared account → BLOCKER, DRIFTED → WAR
 UNKNOWN not PASS, a Deny SCP without an `AWSControlTowerExecution` exemption → WARNING).
 
 ```bash
-python3 tests/test_blocker_paths.py      # 132 tests, plain unittest (no extra deps)
+python3 tests/test_blocker_paths.py      # 227 tests, plain unittest (no extra deps)
 ```
 
 This complements a live run against a healthy landing zone (which only exercises the PASS/INFO

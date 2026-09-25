@@ -79,7 +79,8 @@ EXIT CODES
     0 = no blockers, and every check ran (review any warnings)
     2 = one or more BLOCKERS, or one or more checks could not be evaluated (UNKNOWN).
         --allow-unknown exits 0 on unevaluated checks; --strict also fails on WARNING
-    3 = the precheck could not run (authentication or setup problem)
+    3 = the precheck could not run, so no verdict was reached: no landing zone in this
+        account/Region, or an authentication or setup problem
 
 REQUIRED PERMISSIONS (management account, read-only)
     controltower:ListLandingZones, GetLandingZone, ListEnabledControls, ListEnabledBaselines
@@ -3164,16 +3165,26 @@ def _c(text: str, level: str, use_color: bool, bold: bool = False) -> str:
     return f"{prefix}{text}{_RESET}" if prefix else text
 
 
-def render_text(report: Report, ctx: Context, use_color: bool = False) -> str:
+def render_text(report: Report, ctx: Context, use_color: bool = False,
+                discovery_failed: bool = False) -> str:
     lines = []
     lines.append("=" * 78)
     lines.append((_BOLD + "AWS Control Tower — Pre-Upgrade Precheck" + _RESET)
                  if use_color else "AWS Control Tower — Pre-Upgrade Precheck")
-    lines.append(f"  Management account : {ctx.mgmt_account}")
+    lines.append(f"  Management account : {ctx.mgmt_account or 'not determined'}")
     lines.append(f"  Home region        : {ctx.region}")
-    lines.append(f"  Landing zone       : v{ctx.lz.get('version')} "
-                 f"(latest {ctx.lz.get('latestAvailableVersion')})")
-    lines.append(f"  Governed regions   : {', '.join(ctx.governed_regions)}")
+    # Discovery can fail before any of this is known. Printing a bare Python None, or an
+    # empty list, reads as a rendering bug rather than as "there was nothing to read".
+    _ver = ctx.lz.get("version")
+    if _ver:
+        _latest = ctx.lz.get("latestAvailableVersion")
+        lines.append(f"  Landing zone       : v{_ver}"
+                     + (f" (latest {_latest})" if _latest else ""))
+    else:
+        lines.append("  Landing zone       : not determined")
+    lines.append("  Governed regions   : "
+                 + (", ".join(ctx.governed_regions) if ctx.governed_regions
+                    else "not determined"))
     lines.append("=" * 78)
     for level in (BLOCKER, WARNING, UNKNOWN, INFO, PASS):
         group = report.by_level(level)
@@ -3203,7 +3214,16 @@ def render_text(report: Report, ctx: Context, use_color: bool = False) -> str:
     n_block = len(report.by_level(BLOCKER))
     n_unk = len(report.by_level(UNKNOWN))
     n_warn = len(report.by_level(WARNING))
-    if n_block:
+    if discovery_failed:
+        # None of the checks ran, so there is no verdict to give. Saying "NOT SAFE TO
+        # UPGRADE" here would assert something about a landing zone that was never read -
+        # and it contradicts the exit code, which is 3 (the precheck could not run) rather
+        # than 2 (a blocker was found).
+        lines.append(_c("RESULT: PRECHECK DID NOT RUN — the landing zone could not be read, "
+                        "so none of the checks were evaluated. This is not a verdict on "
+                        "whether the landing zone can be upgraded.", BLOCKER, use_color,
+                        bold=True))
+    elif n_block:
         lines.append(_c(f"RESULT: NOT SAFE TO UPGRADE — {n_block} blocker(s), "
                         f"{n_warn} warning(s), {n_unk} unverified.", BLOCKER, use_color, bold=True))
     else:
@@ -3322,7 +3342,7 @@ def main() -> int:
     report = Report()
     ctx = Context(session, region, args.member_role)
     if not ctx.discover(report):
-        print(render_text(report, ctx, use_color))
+        print(render_text(report, ctx, use_color, discovery_failed=True))
         return 3
     if args.audit_account:
         ctx.audit_account = args.audit_account

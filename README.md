@@ -278,7 +278,7 @@ itself goes to stdout, so piping, redirecting and `--json` are unaffected; redir
 |------|---------|
 | `0` | No blockers, **and every check ran**. Review any warnings. |
 | `2` | One or more blockers — **do not upgrade** until resolved — **or** one or more checks could not be evaluated (`UNKNOWN`). |
-| `3` | The precheck could not run (authentication/setup problem). |
+| `3` | The precheck could not run, so **no verdict was reached** — no landing zone in this account/Region, or an authentication or setup problem. The report says so explicitly rather than reporting a blocker. |
 
 `UNKNOWN` counts toward exit `2` deliberately. A check that could not run is not evidence that the
 environment is safe, and a landing-zone update is not something to start on an unverified report.

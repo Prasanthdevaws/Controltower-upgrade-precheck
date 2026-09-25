@@ -1247,6 +1247,60 @@ class TestBlockerPaths(unittest.TestCase):
         self.assertIn(ct.BLOCKER, levels(rpt))
 
 
+class TestDiscoveryFailureRendering(unittest.TestCase):
+    """When discovery fails, none of the checks ran, so the report must not read as a
+    verdict on the landing zone. Reported from a test against an account with no landing
+    zone: the output said "NOT SAFE TO UPGRADE - 1 blocker(s)" while exiting 3, which is
+    the code for "the precheck could not run" - the two contradicted each other."""
+
+    def _failed_discovery(self):
+        rpt = ct.Report()
+        rpt.add(ct.Finding("discovery", ct.BLOCKER,
+                           "No landing zone found in this account/region",
+                           "ListLandingZones returned empty."))
+        return rpt
+
+    def _bare_ctx(self):
+        ctx = make_ctx(lz={}, governed_regions=[])
+        ctx.mgmt_account = "111111111111"
+        return ctx
+
+    def test_discovery_failure_does_not_claim_the_upgrade_is_unsafe(self):
+        out = ct.render_text(self._failed_discovery(), self._bare_ctx(),
+                             discovery_failed=True)
+        self.assertNotIn("NOT SAFE TO UPGRADE", out)
+        self.assertIn("PRECHECK DID NOT RUN", out)
+
+    def test_discovery_failure_says_it_is_not_a_verdict(self):
+        out = ct.render_text(self._failed_discovery(), self._bare_ctx(),
+                             discovery_failed=True)
+        self.assertIn("not a verdict", out)
+
+    def test_header_does_not_print_python_none(self):
+        # The header used to render "Landing zone : vNone (latest None)" and an empty
+        # governed-regions line, which reads as a rendering bug rather than as "unknown".
+        out = ct.render_text(self._failed_discovery(), self._bare_ctx(),
+                             discovery_failed=True)
+        self.assertNotIn("None", out)
+        self.assertIn("Landing zone       : not determined", out)
+        self.assertIn("Governed regions   : not determined", out)
+
+    def test_a_real_blocker_still_says_not_safe_to_upgrade(self):
+        # The default path must be unchanged: a blocker found by an actual check is still
+        # a verdict.
+        rpt = ct.Report()
+        rpt.add(ct.Finding("lz_status", ct.BLOCKER, "Landing zone is in a FAILED state"))
+        out = ct.render_text(rpt, make_ctx())
+        self.assertIn("NOT SAFE TO UPGRADE", out)
+        self.assertNotIn("PRECHECK DID NOT RUN", out)
+
+    def test_latest_version_omitted_rather_than_rendered_as_none(self):
+        ctx = make_ctx(lz={"version": "3.3"}, governed_regions=["us-east-1"])
+        out = ct.render_text(ct.Report(), ctx)
+        self.assertIn("Landing zone       : v3.3", out)
+        self.assertNotIn("None", out)
+
+
 class TestColorRendering(unittest.TestCase):
     """The severity coloring is opt-in, TTY-gated, and never leaks into plain output."""
 
